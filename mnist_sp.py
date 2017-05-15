@@ -115,16 +115,26 @@ def synthesize(seed, diag=False):
     return synth
 
 
-def MNIST_test():
+def MNIST_test(r, t):
 
+    # Load and prepare the data
     train_labels, train_images, test_labels, test_images = load_mnist()
+    if False:
+        # Experiment to verify that input dimensions are handled correctly
+        # If you enable this, don't forget to rescale the radii as well as the input.
+        from scipy.ndimage import zoom
+        new_sz = (1, 4, 1)
+        train_images = [zoom(im, new_sz, order=0) for im in train_images]
+        test_images  = [zoom(im, new_sz, order=0) for im in test_images]
     training_data = list(zip(train_images, train_labels))
     test_data = list(zip(test_images, test_labels))
 
-    enc = ImageEncoder((28, 28))
-    col_shape = (56, 56)
+    enc = ImageEncoder(train_images[0].shape[:2])
+    print("Input Shape", enc.output_shape)
+    # col_shape = (56, 56)
+    col_shape = (112, 112)
     print("Column Shape", col_shape)
-    radii = (3, 3)
+    radii = (r, r)
     print("Radii", radii)
     machine = SpatialPooler(enc.output_shape, col_shape, radii)
 
@@ -132,7 +142,7 @@ def MNIST_test():
     class_shape = (10,)
     sdrc = SDR_Classifier(col_shape, class_shape, None)
 
-    plot_noise_robustness = True
+    plot_noise_robustness = False
     rand_imgs     = random.sample(test_images, 100)
     rand_imgs_enc = [enc.encode(np.squeeze(q)) for q in rand_imgs]
     if plot_noise_robustness:
@@ -142,9 +152,7 @@ def MNIST_test():
     print("Initialiation complete, Begining training phase...")
     # The difference between x1 and x100 the training time is 79.86% and 81.19% accuracy...
     # These things might be immune to overtraining.
-    train_time = len(train_images)
-    # train_time = len(train_images) // 4
-    # train_time = 100                        # Fastest
+    train_time = int(round(len(train_images) * t))
     print("Training Time", train_time)
     for i in range(train_time):
         img, lbl = random.choice(training_data)
@@ -158,10 +166,10 @@ def MNIST_test():
 
     print("Training complete, Begining evaluation phase...")
 
-    print('duty cycle min ',  np.min(machine.average_activations))
-    print('duty cycle mean', np.mean(machine.average_activations))
-    print('duty cycle std ',  np.std(machine.average_activations))
-    print('duty cycle max ',  np.max(machine.average_activations))
+    print('duty cycle min ',  np.min(machine.average_activations) * 100, '%')
+    print('duty cycle mean', np.mean(machine.average_activations) * 100, '%')
+    print('duty cycle std ',  np.std(machine.average_activations) * 100, '%')
+    print('duty cycle max ',  np.max(machine.average_activations) * 100, '%')
 
     # Evaluate the classifier
     score = 0
@@ -191,7 +199,7 @@ def MNIST_test():
 
     plt.subplot(2, 3, 2)
     plt.imshow(machine.zz_raw, interpolation='nearest')
-    plt.title('Raw Excitement')
+    plt.title('Raw Excitement, radius' + str(radii))
 
     plt.subplot(2, 3, 3)
     plt.imshow(machine.average_activations.reshape(col_shape), interpolation='nearest')
@@ -219,7 +227,7 @@ def MNIST_test():
         plt.title("Robustness. Red is before, Green is after training %d cycles"%machine.age)
 
     # Show a table of SP inputs & outputs
-    if True:
+    if False:
         examples = 5    # This many rows of examples, one example per row
         cols = 4        # This many columns
         plt.figure(3)
@@ -242,5 +250,14 @@ def MNIST_test():
 
 
 if __name__ == '__main__':
-    # number_test()
-    MNIST_test()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-r', '--radius', type=float, default=3)
+    parser.add_argument('-t', '--time', type=float, default=.5)
+    parser.add_argument('--note', type=str)
+    args = parser.parse_args()
+
+    if args.note:
+        print()
+        print(args.note)
+    MNIST_test(r=args.radius, t=args.time)

@@ -1,4 +1,7 @@
 
+# TODO: Author, copyrite, and licesnse notes obn each file! These are on git hub too.
+# TODO: Make work with sparse input
+
 import numpy as np
 import math
 import scipy.ndimage
@@ -45,17 +48,17 @@ class SpatialPooler:
         proximal inputs to each cortical mini-column.
 
 
-    This implementation is based on but differs from the one described by Numenta's Spacial Pooler
-    white paper, (Cui, Ahmad, Hawkins, 2017, "The HTM Spacial Pooler - a neocortical...") in two
-    main ways boosting function and the local inhibition mechanism.
+    This implementation is based on but differs from the one described by
+    Numenta's Spacial Pooler white paper, (Cui, Ahmad, Hawkins, 2017, "The HTM
+    Spacial Pooler - a neocortical...") in two main ways boosting function and
+    the local inhibition mechanism.
 
 
     Logarithmic Boosting Function:
-    In (Cui, Ahmad, Hawkins, 2017), they use an exponential boosting function.
-        See figure 1D, a plot of their boosting function. 
-    Notice that the curve intercepts the boost-factor axis and has an asymptotes 
-    along the activation frequency axis.  The activation frequency is by definition
-    constrained to the range [0, 1].  
+    Numenta uses an exponential boosting function.  See figure 1D, a plot of their
+    boosting function.  Notice that the curve intercepts the boost-factor axis
+    and has an asymptotes along the activation frequency axis.  The activation
+    frequency is by definition constrained to the range [0, 1].
 
     I use the inverse of their function, which intercepts the activation-frequency
     axis and asypmtotically approaches the boost-factors axis.  Then scale the 
@@ -72,14 +75,16 @@ class SpatialPooler:
 
 
     Faster Local Inhibition:
-    In (Cui, Ahmad, Hawkins, 2017), they activate the top K most excited columns in each area, 
-    where K is proportional to the sparsity, and the area is a fixed radius from each column 
-    which is porportional to the radius of the receptive field.  
+    Numenta activates the top K most excited columns in each area, where K is
+    proportional to the sparsity, and the area is a fixed radius from each
+    column which is porportional to the radius of the receptive field.
 
-    This activates the top K most excited columns globally, after normalizing all columns by their
-    local area mean and standard deviation.  The local area is a gaussian filtering and
-    the standard deviation of the gaussian is proportional to the radius of the receptive field.  
-    In psuedo code:
+    This activates the top K most excited columns globally, after normalizing
+    all columns by their local area mean and standard deviation.  The local area
+    is a gaussian window and the standard deviation of the gaussian is
+    proportional to the radius of the receptive field.
+
+    In pseudo code:
         mean_normalized = excitement - gaussian_blur( excitement, radius )
         standard_deviation = sqrt( gaussian_blur( mean_normalized ^ 2, radius ) )
         normalized = mean_normalized / standard_deviation
@@ -90,11 +95,12 @@ class SpatialPooler:
         Argument input_dimensions is tuple of input space dimensions
         Argument column_dimensions is tuple of output space dimensions
         Argument radii is tuple of convolutional radii, must be same length as column_dimensions
+                 radii units are the input space units
                  radii is optional, if not given assumes no topology
 
-        If column_dimensions is shorter than input_dimensions then the trailing input_dimensions
-        are not convolved over, are instead broadcast to all columns which are connected via the
-        convolution in the other dimensions.
+        If column_dimensions is shorter than input_dimensions then the trailing
+        input_dimensions are not convolved over, are instead broadcast to all
+        columns which are connected via the convolution in the other dimensions.
         """
         self.input_dimensions  = input_dimensions
         self.column_dimensions = column_dimensions
@@ -103,8 +109,9 @@ class SpatialPooler:
         self.topology = radii is not None
         self.age = 0
 
-        # Neurons are identified by their index.
-        # proximal_array[neuron-index][input-number] = value
+        # Columns are identified by their index (which is a single flat index).
+        # All columns have the same number of inputs (which are identified by a single flat index).
+        # proximal_array[column-index][input-index] = value
         # proximal_sources stores index into flattened input.
         if self.topology:
             self.conv_radii = radii
@@ -123,10 +130,12 @@ class SpatialPooler:
         self.proximal_permenances_threshold = 0.5
         self.column_sparsity = 0.02
 
-        potential_synapses_per_neuron = self.proximal_sources.shape[1]
-        self.boost_factor = math.log(potential_synapses_per_neuron)
-        self.boost_factor *= 2
-        self.boost_factor *= 2
+        if False:
+            # Exponential Boosting Stuff, Delete eventually if never used...
+            potential_synapses_per_neuron = self.proximal_sources.shape[1]
+            self.boost_factor = math.log(potential_synapses_per_neuron)
+            self.boost_factor *= 2
+            self.boost_factor *= 2
         self.average_activations_alpha = 0.001
         # Initialize the duty cycles to far below the target duty cycle.
         self.average_activations = np.zeros(self.num_columns) + self.column_sparsity / 10000000000
@@ -222,21 +231,30 @@ class SpatialPooler:
 
         # Local Inhibition
         if self.topology:
+            # Convert the radii from input space to column space
+            col_space_dims = len(self.column_dimensions)
+            scale_factor = np.divide(self.column_dimensions, self.input_dimensions[:col_space_dims])
+            inhibition_radii = np.multiply(self.conv_radii, scale_factor)
+
             #
             # FINE TUNING
             #
+            # inhibition_radii is used as the standard deviation for the
+            # gaussian window which defines the local neighborhood of a column.
+            # Areas more distant than inhibition_radii supress each other even
+            # though they have no shared input.  Areas closer to each other will
+            # suppress each other more.  Divide inhibition_radii by 2 so that
+            # 95% of the area in the window has shared input and 68% of the
+            # inhibition comes from columns within 1/2 of the convolutional
+            # radius.
+            #
             # In a normal distribution:
             # 68% of area is within one standard deviation
-            #       This whats currently done
             # 95% of area is within two standard deviations
+            #       This whats currently done.
             # 99% of area is within three standard deviations
             #
-            # Areas more distant than self.conv_radii supress each other even though they have no 
-            # shared input.  Areas closer to each other will suppress each other more.
-            #
-            # Should be somewhere between 1/2 and 1 and so I will leave it at 3/4.
-            #
-            inhibition_radii = np.multiply(self.conv_radii, .75)
+            inhibition_radii = np.divide(inhibition_radii, 2)
 
             raw_excitment = raw_excitment.reshape(self.column_dimensions)
             avg_local_excitment = scipy.ndimage.filters.gaussian_filter(raw_excitment, inhibition_radii)
@@ -284,14 +302,13 @@ class SpatialPooler:
         dense[output] = True
         return dense
 
-    def plot_boost_functions(self):
+    def plot_boost_functions(self, beta = 15):
         # Generate sample points
         dc = np.linspace(0, 1, 10000)
         from matplotlib import pyplot as plt
         fig = plt.figure(1)
         ax = plt.subplot(111)
         log_boost = lambda f: np.log(f) / np.log(self.column_sparsity)
-        beta = 40
         exp_boost = lambda f: np.exp(beta * (self.column_sparsity - f))
         logs = [log_boost(f) for f in dc]
         exps = [exp_boost(f) for f in dc]
@@ -399,20 +416,15 @@ class SpatialPooler:
 class SDR_Classifier:
     """
     Maximum Likelyhood classifier for SDRs.
-
-    Note:
-    Numenta describes using keeping an array of actual values for when scalars are used.
-    This way they can guess the value within the bucket
-
-    Also should use exponential rolling averages (but does not).
-
-    https://www.youtube.com/watch?v=QZBtaP_gcn0
     """
-    def __init__(self, input_shape, output_shape, output_sparsity):
+    def __init__(self, input_shape, output_shape, output_sparsity, diag=True):
+        self.alpha = 1/1000
         self.input_shape = list(input_shape)
         self.output_shape = list(output_shape)
         self.stats = np.zeros(self.input_shape + self.output_shape)
         self.data_points = 0
+        if diag:
+            print("SDR Classifier alpha %g"%self.alpha)
 
     def train(self, inp, out):
         """
@@ -421,8 +433,8 @@ class SDR_Classifier:
         inp = (ndarray of input space dim 0 indexes, ndarray of input space dim 1 indexes, ...)
         out = (ndarray of output space dim 0 indexes, ndarray of output space dim 1 indexes, ...)
         """
-        self.stats[inp + out] += 1
-        # print(self.stats[inp + out])
+        self.stats[inp] *= (1-self.alpha)
+        self.stats[inp + out] += self.alpha
         self.data_points += 1
 
     def predict(self, inp):
@@ -431,4 +443,16 @@ class SDR_Classifier:
         Returns tuple of indecies in output space
         """
         return np.sum(self.stats[inp], axis=0)
+
+
+class TemporalPooler():
+    """
+    """
+    def __init__(self):
+        pass
+
+
+
+
+
 
