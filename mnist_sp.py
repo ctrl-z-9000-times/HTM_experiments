@@ -1,6 +1,9 @@
 #!/usr/bin/python3
+# Written by David McDougall, 2017
+
 
 from htm import *
+import time
 
 
 def load_mnist():
@@ -61,11 +64,11 @@ def synthesize(seed, diag=False):
     Modify an image with random shifts, scales, and rotations.
     Use this function to expand the training dataset and make it more robust to these transforms.
 
-    If needed I might implement more complicated perturbations.
+    TRANSLATION DISABLED!
+    MNIST doesn't have any shifts in it so adding them in makes the task harder.
 
-    TODO: Stretching images/scaling/skew
-
-    Note: This function has only been tested on MNIST images, as returned by load_mnist()
+    TODO: Stretching/scaling/skewing images
+    TODO: Consider adding gausian noise
     """
     # Apply a random rotation
     theta_max = 15      # degrees
@@ -75,27 +78,28 @@ def synthesize(seed, diag=False):
     # Stretch the image in a random direction
     pass    # TODO
 
-    # Find the bounding box of the character
-    r_occupied = np.sum(synth, axis=1)
-    for r_min in range(len(r_occupied)):
-        if r_occupied[r_min]:
-            break
-    for r_max in range(len(r_occupied)-1, -1, -1):
-        if r_occupied[r_max]:
-            break
+    if False:
+        # Find the bounding box of the character
+        r_occupied = np.sum(synth, axis=1)
+        for r_min in range(len(r_occupied)):
+            if r_occupied[r_min]:
+                break
+        for r_max in range(len(r_occupied)-1, -1, -1):
+            if r_occupied[r_max]:
+                break
 
-    c_occupied = np.sum(synth, axis=0)
-    for c_min in range(len(c_occupied)):
-        if c_occupied[c_min]:
-            break
-    for c_max in range(len(c_occupied)-1, -1, -1):
-        if c_occupied[c_max]:
-            break
+        c_occupied = np.sum(synth, axis=0)
+        for c_min in range(len(c_occupied)):
+            if c_occupied[c_min]:
+                break
+        for c_max in range(len(c_occupied)-1, -1, -1):
+            if c_occupied[c_max]:
+                break
 
-    # Apply a random shift
-    r_shift = random.randint(-r_min, len(r_occupied) -1 -r_max)
-    c_shift = random.randint(-c_min, len(c_occupied) -1 -c_max)
-    synth = scipy.ndimage.interpolation.shift(synth, [r_shift, c_shift, 0])
+        # Apply a random shift
+        r_shift = random.randint(-r_min, len(r_occupied) -1 -r_max)
+        c_shift = random.randint(-c_min, len(c_occupied) -1 -c_max)
+        synth = scipy.ndimage.interpolation.shift(synth, [r_shift, c_shift, 0])
 
     if diag:
         from matplotlib import pyplot as plt
@@ -129,8 +133,10 @@ def MNIST_test(r, t):
     training_data = list(zip(train_images, train_labels))
     test_data = list(zip(test_images, test_labels))
 
+    start_time = time.time()
     enc = ImageEncoder(train_images[0].shape[:2])
     print("Input Shape", enc.output_shape)
+    # col_shape = (28, 28)
     # col_shape = (56, 56)
     col_shape = (112, 112)
     print("Column Shape", col_shape)
@@ -141,6 +147,7 @@ def MNIST_test(r, t):
     # Make an SDR Maximum Likelyhood classifier
     class_shape = (10,)
     sdrc = SDR_Classifier(col_shape, class_shape, None)
+    # sdrc = KNN_Classifier(col_shape, class_shape)
 
     plot_noise_robustness = False
     rand_imgs     = random.sample(test_images, 100)
@@ -152,15 +159,18 @@ def MNIST_test(r, t):
     print("Initialiation complete, Begining training phase...")
     # The difference between x1 and x100 the training time is 79.86% and 81.19% accuracy...
     # These things might be immune to overtraining.
-    train_time = int(round(len(train_images) * t))
-    print("Training Time", train_time)
-    for i in range(train_time):
+    train_cycles = int(round(len(train_images) * t))
+    compute_time = 0
+    print("Training Time", train_cycles)
+    for i in range(train_cycles):
         img, lbl = random.choice(training_data)
-        img = synthesize(img)                   # SYNTHETIC TRAINING DATA
+        img = synthesize(img, diag=False)       # SYNTHETIC TRAINING DATA
+        compute_start = time.time()             # Includes time to encode input
         img_enc = enc.encode(np.squeeze(img))
         state = machine.compute(img_enc)
         sdrc.train(state, (lbl,))
-        modulus = train_time // 10
+        compute_time += time.time() - compute_start
+        modulus = train_cycles // 10
         if i % modulus == modulus-1:
             machine.entropy()
 
@@ -186,7 +196,10 @@ def MNIST_test(r, t):
         if prediction == lbl:
             score += 1
     print("Score", score, '/', len(test_data))
-    print("Predicted Classes", all_pred)
+    print("Predicted Classes", all_pred)    # Sanity check
+    end_time = time.time()
+    print("Compute time %g seconds"%(compute_time / train_cycles))
+    print("Elapsed time %g seconds"%(end_time - start_time))
 
     # Show Diagnostics for a sample input
     # First run a sample input through the pipeline to setup the debug variables.
@@ -253,7 +266,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-r', '--radius', type=float, default=3)
-    parser.add_argument('-t', '--time', type=float, default=.5)
+    parser.add_argument('-t', '--time', type=float, default=1.0)
     parser.add_argument('--note', type=str)
     args = parser.parse_args()
 

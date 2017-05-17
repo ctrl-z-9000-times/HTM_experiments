@@ -1,6 +1,8 @@
+# Written by David McDougall, 2017
 
-# TODO: Author, copyrite, and licesnse notes obn each file! These are on git hub too.
-# TODO: Make work with sparse input
+# High score: 93%
+# trained 5 x len(dataset)
+
 
 import numpy as np
 import math
@@ -16,7 +18,7 @@ class RandomDistributedScalarEncoder:
     def __init__(self, resolution, size, on_bits):
         self.resolution = resolution
         self.size = size
-        self.on_bits = on_bits
+        self.on_bits = int(round(on_bits))
         self.output_shape = (size,)
 
     def encode(self, value):
@@ -31,15 +33,20 @@ class RandomDistributedScalarEncoder:
 
 class ImageEncoder:
     def __init__(self, input_space):
-        self.output_shape = tuple(input_space) + (3,)
+        self.output_shape = tuple(input_space) + (2,)
 
     def encode(self, image):
         mean = np.mean(image)
+        on_bits  = image >= mean
+        off_bits = np.logical_not(on_bits)
+        return np.dstack([on_bits, off_bits])
+
+        # Grey level feature
+        # I don't think these are useful for MNIST
         on_bits = image >= min(2*mean, 255)
         grey_bits = np.logical_and(image >= mean/2, np.logical_not(on_bits))
         off_bits = np.logical_and(np.logical_not(on_bits), np.logical_not(grey_bits))
         return np.dstack([on_bits, grey_bits, off_bits])
-        return np.nonzero(np.dstack([on_bits, off_bits]))
 
 
 class SpatialPooler:
@@ -50,15 +57,15 @@ class SpatialPooler:
 
     This implementation is based on but differs from the one described by
     Numenta's Spacial Pooler white paper, (Cui, Ahmad, Hawkins, 2017, "The HTM
-    Spacial Pooler - a neocortical...") in two main ways boosting function and
-    the local inhibition mechanism.
+    Spacial Pooler - a neocortical...") in two main ways, the boosting function
+    and the local inhibition mechanism.
 
 
     Logarithmic Boosting Function:
-    Numenta uses an exponential boosting function.  See figure 1D, a plot of their
-    boosting function.  Notice that the curve intercepts the boost-factor axis
-    and has an asymptotes along the activation frequency axis.  The activation
-    frequency is by definition constrained to the range [0, 1].
+    Numenta uses an exponential boosting function.  See figure 1D, a plot of
+    their boosting function.  Notice that the curve intercepts the boost-factor
+    axis and has an asymptotes along the activation frequency axis.  The
+    activation frequency is by definition constrained to the range [0, 1].
 
     I use the inverse of their function, which intercepts the activation-frequency
     axis and asypmtotically approaches the boost-factors axis.  Then scale the 
@@ -90,7 +97,7 @@ class SpatialPooler:
         normalized = mean_normalized / standard_deviation
         activate = top_k( normalized, sparsity * number_of_columns )
     """
-    def __init__(self, input_dimensions, column_dimensions, radii=None, **kw_args):
+    def __init__(self, input_dimensions, column_dimensions, radii=None):
         """
         Argument input_dimensions is tuple of input space dimensions
         Argument column_dimensions is tuple of output space dimensions
@@ -109,6 +116,8 @@ class SpatialPooler:
         self.topology = radii is not None
         self.age = 0
 
+        # TODO: subsample_connections loss % should be a parameter.
+
         # Columns are identified by their index (which is a single flat index).
         # All columns have the same number of inputs (which are identified by a single flat index).
         # proximal_array[column-index][input-index] = value
@@ -122,11 +131,12 @@ class SpatialPooler:
             self.subsample_connections(.10)
 
         # proximal_permanences's shape is the same as proximal_sources's
-        self.proximal_permanences = np.random.random(self.proximal_sources.shape) ** 2
+        self.proximal_permanences = np.random.random(self.proximal_sources.shape)
 
         self.proximal_coincidence_inc = 0.1
         self.proximal_coincidence_dec = 0.02
-        # Coincidence ratio = proximal_coincidence_inc / proximal_coincidence_dec
+        coincidence_ratio = self.proximal_coincidence_inc / self.proximal_coincidence_dec
+        print('Coincidence Ratio', coincidence_ratio)
         self.proximal_permenances_threshold = 0.5
         self.column_sparsity = 0.02
 
@@ -219,7 +229,7 @@ class SpatialPooler:
         if learn:   # Don't apply boosting during evaluations
             if True:
                 # Logarithmic Boosting Function
-                boost = np.log(self.average_activations) / np.log(self.column_sparsity)
+                boost = np.log2(self.average_activations) / np.log2(self.column_sparsity)
                 boost = np.nan_to_num(boost)
                 self.zz_boostd = raw_excitment = boost * raw_excitment
             else:
@@ -251,7 +261,7 @@ class SpatialPooler:
             # In a normal distribution:
             # 68% of area is within one standard deviation
             # 95% of area is within two standard deviations
-            #       This whats currently done.
+            #       This what's currently done.
             # 99% of area is within three standard deviations
             #
             inhibition_radii = np.divide(inhibition_radii, 2)
@@ -276,11 +286,10 @@ class SpatialPooler:
 
         if learn:
             self.age += 1
-            # Update the exponential rolling average of each columns activations.
+            # Update the exponential rolling average of each columns activation frequency.
             alpha = self.average_activations_alpha
-            active_array = np.zeros_like(self.average_activations)
-            active_array[self.active_columns] = alpha
-            self.average_activations = (1 - alpha) * self.average_activations + active_array
+            self.average_activations *= (1 - alpha)                 # Decay with time
+            self.average_activations[self.active_columns] += alpha  # Incorperate this sample
 
             # Update proximal synapse permenances.
             updates = np.choose(inputs[self.active_columns], 
@@ -442,17 +451,111 @@ class SDR_Classifier:
         Argument inputs is ndarray of indexes into the input space.
         Returns tuple of indecies in output space
         """
+        return np.product(self.stats[inp], axis=0)
         return np.sum(self.stats[inp], axis=0)
+
+
+class KNN_Classifier:
+    """
+    K-Nearest Neighbors classifier for SDRs.
+
+    This takes too long to run.  Too many dimensions...
+    """
+    def __init__(self, input_shape, output_shape, k=10, diag=True):
+        self.input_shape  = list(input_shape)
+        self.output_shape = list(output_shape)
+        self.k = k
+        self.inputs  = []
+        self.outputs = []
+        self.kdtree  = None
+        if diag:
+            print("SDR Classifier K =", k)
+
+    def train(self, inp, out):
+        """
+        Argument inp is tuple of index arrays, as output from the SP.compute method
+        Argument out is tuple of index arrays, SDR encoded value of target output
+        inp = (ndarray of input space dim 0 indexes, ndarray of input space dim 1 indexes, ...)
+        out = (ndarray of output space dim 0 indexes, ndarray of output space dim 1 indexes, ...)
+        """
+        # Any existing KD tree will need to be rebuilt to include this new data.
+        self.kdtree = None
+        # Convert from index arrays to data dense boolean arrays
+        dense_inp = np.zeros(self.input_shape, dtype=np.bool)
+        dense_inp[inp] = True
+        self.inputs.append(dense_inp.reshape(-1))   # reshape(-1) flattens array
+        self.outputs.append(out)
+
+    def predict(self, inp):
+        """
+        Argument inputs is ndarray of indexes into the input space.
+        Returns tuple of indecies in output space
+        """
+        if self.kdtree is None:
+            # Build the KD tree
+            inputs  = np.stack(self.inputs)
+            import scipy.spatial
+            # Default leafsize is 10.
+            self.kdtree = scipy.spatial.cKDTree(inputs, leafsize=1)
+
+        dense_inp = np.zeros(self.input_shape, dtype=np.bool)
+        dense_inp[inp] = True
+        dist, pred = self.kdtree.query([dense_inp.flatten()], k=self.k, p=1)
+        overlap = np.count_nonzero(inp) - dist/2
+        result = np.sum(pred * overlap, axis=0)
+        return result
 
 
 class TemporalPooler():
     """
     """
-    def __init__(self):
+    def __init__(self, column_dimensions, neurons_per_column):
+        self.column_dimensions  = tuple(column_dimensions)
+        self.neurons_per_column = neurons_per_column
+        self.num_columns = np.product(column_dimensions)
+        self.num_neurons = neurons_per_column * self.num_columns
+
+        # basal_sources[neuron-index][input-number] = input-index
+        sources = np.arange(self.num_neurons)
+        self.basal_sources = np.stack([sources]*self.num_neurons)
+        self.subsample_connections(0.75)
+        self.basal_permanences = np.random.random(self.basal_sources.shape)
+
+        self.basal_permanence_inc = 0.10
+        self.basal_permanence_dec = 0.02
+        self.basal_permenances_threshold = 0.5
+
+        self.reset()
+
+    def subsample_connections(self, loss):
+        """Randomly severs 'loss' fraction of inputs from every column."""
+        num_inputs = int(round(self.basal_sources.shape[1] * (1-loss)))
+        print("num_inputs", num_inputs)
+        shuffled = np.random.permutation(self.basal_sources.T)
+        shuffled = shuffled[:num_inputs, :]
+        self.basal_sources = np.sort(shuffled, axis=0).T
+
+    def reset(self):
+        self.state = np.zeros(self.num_neurons)
+
+    def compute(self, column_activations):
+        """
+        Returns index array of active neurons.
+        """
+        # Flatten everything
+        columns = np.ravel_multi_index(column_activations, self.column_dimensions)
+
+        # Active columns accumulate input
+        # source_index[active-neuron][num-inputs] = source-neuron-index
+        source_index = self.basal_sources[columns]
+        excitement = np.sum(self.state[source_index], axis=1)
+
+        # Activate Neurons
         pass
+        self.anomaly = None
 
-
-
+        # Learn
+        pass
 
 
 

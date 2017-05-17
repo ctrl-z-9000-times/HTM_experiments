@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# Written by David McDougall, 2017
 
 from htm import *
 
@@ -38,7 +39,7 @@ def number_test():
     sep_b4, ovlp_b4 = overlap_vs_input_dist()
 
     # Train
-    train_time = len(data_set) * 2
+    train_time = len(data_set)
     for i in range(train_time):
         if True:
             inp = random.choice(data_set)
