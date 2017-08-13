@@ -1,9 +1,10 @@
 #!/usr/bin/python3
 # Written by David McDougall, 2017
 
-
 from htm import *
+from matplotlib import pyplot as plt
 import time
+import cProfile
 
 
 def load_mnist():
@@ -45,7 +46,7 @@ def load_mnist():
                 vec = raw[data_start + img_index*img_size : data_start + (img_index+1)*img_size]
                 # vec = [ord(c) for c in vec]   # python2?
                 vec = list(vec)
-                vec = np.array(vec, dtype=np.float32)
+                vec = np.array(vec, dtype=np.uint8)
                 buf = np.reshape(vec, (rows, cols, 1))
                 imgs.append(buf)
             assert(len(raw) == data_start + img_size * num_imgs)   # All data should be used.
@@ -59,28 +60,25 @@ def load_mnist():
     return train_labels, train_images, test_labels, test_images
 
 
+# TODO: Synthesize needs random scaling...
 def synthesize(seed, diag=False):
     """
     Modify an image with random shifts, scales, and rotations.
     Use this function to expand the training dataset and make it more robust to these transforms.
 
-    TRANSLATION DISABLED!
-    MNIST doesn't have any shifts in it so adding them in makes the task harder.
+    Note: translation is worse for training MNIST b/c the test set is centered.
+    Translation just makes the problem harder.
 
     TODO: Stretching/scaling/skewing images
-    TODO: Consider adding gausian noise
     """
     # Apply a random rotation
     theta_max = 15      # degrees
     theta = random.uniform(-theta_max, theta_max)
     synth = scipy.ndimage.interpolation.rotate(seed, theta, order=0, reshape=False)
 
-    # Stretch the image in a random direction
-    pass    # TODO
-
-    if False:
+    def bounding_box(img):
         # Find the bounding box of the character
-        r_occupied = np.sum(synth, axis=1)
+        r_occupied = np.sum(img, axis=1)
         for r_min in range(len(r_occupied)):
             if r_occupied[r_min]:
                 break
@@ -88,15 +86,21 @@ def synthesize(seed, diag=False):
             if r_occupied[r_max]:
                 break
 
-        c_occupied = np.sum(synth, axis=0)
+        c_occupied = np.sum(img, axis=0)
         for c_min in range(len(c_occupied)):
             if c_occupied[c_min]:
                 break
         for c_max in range(len(c_occupied)-1, -1, -1):
             if c_occupied[c_max]:
                 break
+        return r_min, r_max, c_min, c_max
 
+    # Stretch the image in a random direction
+    pass
+
+    if False:
         # Apply a random shift
+        r_min, r_max, c_min, c_max = bounding_box(synth)
         r_shift = random.randint(-r_min, len(r_occupied) -1 -r_max)
         c_shift = random.randint(-c_min, len(c_occupied) -1 -c_max)
         synth = scipy.ndimage.interpolation.shift(synth, [r_shift, c_shift, 0])
@@ -119,10 +123,90 @@ def synthesize(seed, diag=False):
     return synth
 
 
-def MNIST_test(r, t):
+class MNIST_Parameters(GA_Parameters):
+    parameters = ['sp', 'sdrc',]
+    def __init__(self,):
+        self.sp = SpatialPoolerParameters(
+            column_dimensions   = (1.216e+02, 1.274e+02),
+            radii               = (3.308e+00, 1.933e+00),
+            potential_pool      = 1.173e+02,
+            sparsity            = 9.436e-01,
+            coincidence_inc     = 3.532e-02,
+            coincidence_dec     = 1.069e-02,
+            permanence_thresh   = 3.901e-01,
+            boosting_alpha      = 7.503e-04,
+        )
+        self.sdrc = SDRC_Parameters(alpha=1.129e-03)
 
+
+def evaluate(parameters):
+    # Load data, Setup spatial pooler machine.
+    train_labels, train_images, test_labels, test_images = load_mnist()
+    training_data = list(zip(train_images, train_labels))
+    test_data     = list(zip(test_images, test_labels))
+    enc           = BWImageEncoder(train_images[0].shape[:2], diag=False)
+    machine       = SpatialPooler(parameters.sp, enc.output_shape)
+    class_shape   = (10,)
+    sdrc          = SDR_Classifier(parameters.sdrc, machine.column_dimensions, class_shape, 'index')
+
+    # Training Loop
+    train_cycles = len(train_images) * 1/2
+    compute_time = 0
+    for i in range(int(round(train_cycles))):
+        img, lbl      = random.choice(training_data)
+        img           = synthesize(img, diag=False)
+        img_enc       = enc.encode(np.squeeze(img))
+        compute_start = time.time()
+        state         = machine.compute(img_enc)
+        sdrc.train(state, (lbl,))
+        compute_time  += time.time() - compute_start
+
+    # Testing Loop
+    score = 0
+    for img, lbl in test_data:
+        img_enc     = np.squeeze(enc.encode(img))
+        state       = machine.compute(img_enc, learn=False)
+        prediction  = np.argmax(sdrc.predict(state))
+        if prediction == lbl:
+            score   += 1
+    return score / len(test_data)
+
+
+if __name__ == '__main__':
+    genetic_algorithm(
+        MNIST_Parameters,
+        evaluate,
+        population_size                 = 10,
+        num_epochs                      = 5,
+        seed                            = False,
+        seed_mutations_per_parameter    = 20,
+        seed_mutation_percent           = 0.05,
+        mutation_probability            = 0.20,
+        mutation_percent                = 0.10,
+        filename                        = 'checkpoint',
+        num_processes                   = 7,
+        profile                         = True,
+    )
+    exit(0)
+
+
+def MNIST_test(r=4, pp=240, t=1):
     # Load and prepare the data
     train_labels, train_images, test_labels, test_images = load_mnist()
+    if False:
+        # Experiment to test what happens when areas are not given meaningful
+        # input.  Adds 2 pixel black border around image.  Also manually
+        # disabled translation in the synthesize funtion.
+        def expand_images(mnist_images):
+            new_images = []
+            for img in mnist_images:
+                assert(img.shape == (28, 28, 1))
+                new_img = np.zeros((32, 32, 1))
+                new_img[2:-2, 2:-2, :] = img
+                new_images.append(new_img)
+            return new_images
+        train_images = expand_images(train_images)
+        test_images  = expand_images(test_images)
     if False:
         # Experiment to verify that input dimensions are handled correctly
         # If you enable this, don't forget to rescale the radii as well as the input.
@@ -133,122 +217,85 @@ def MNIST_test(r, t):
     training_data = list(zip(train_images, train_labels))
     test_data = list(zip(test_images, test_labels))
 
-    start_time = time.time()
-    enc = ImageEncoder(train_images[0].shape[:2])
-    print("Input Shape", enc.output_shape)
-    # col_shape = (28, 28)
-    # col_shape = (56, 56)
-    col_shape = (112, 112)
-    print("Column Shape", col_shape)
-    radii = (r, r)
-    print("Radii", radii)
-    machine = SpatialPooler(enc.output_shape, col_shape, radii)
-
-    # Make an SDR Maximum Likelyhood classifier
+    col_shape   = (56, 56)        # 92% Accuracy
+    col_shape   = (112, 112)      # 93% Accuracy
+    radii       = (r, r)
     class_shape = (10,)
-    sdrc = SDR_Classifier(col_shape, class_shape, None)
-    # sdrc = KNN_Classifier(col_shape, class_shape)
 
-    plot_noise_robustness = False
+    start_time = time.time()
+    enc     = BWImageEncoder(train_images[0].shape[:2])
+    machine = SpatialPooler(enc.output_shape, col_shape, radii, potential_pool=pp)
+    sdrc    = SDR_Classifier(col_shape, class_shape, 'index')
+
     rand_imgs     = random.sample(test_images, 100)
     rand_imgs_enc = [enc.encode(np.squeeze(q)) for q in rand_imgs]
+    plot_noise_robustness = False
     if plot_noise_robustness:
         x0, y0 = machine.noise_robustness(rand_imgs_enc)
-
-
     print("Initialiation complete, Begining training phase...")
+
     # The difference between x1 and x100 the training time is 79.86% and 81.19% accuracy...
     # These things might be immune to overtraining.
     train_cycles = int(round(len(train_images) * t))
     compute_time = 0
+    profile = cProfile.Profile()
     print("Training Time", train_cycles)
     for i in range(train_cycles):
         img, lbl = random.choice(training_data)
-        img = synthesize(img, diag=False)       # SYNTHETIC TRAINING DATA
+        img = synthesize(img, diag=False)
         compute_start = time.time()             # Includes time to encode input
         img_enc = enc.encode(np.squeeze(img))
+        profile.enable()
         state = machine.compute(img_enc)
         sdrc.train(state, (lbl,))
+        profile.disable()
         compute_time += time.time() - compute_start
-        modulus = train_cycles // 10
-        if i % modulus == modulus-1:
-            machine.entropy()
+        modulus = 5000
+        # if i % modulus == modulus-1:
+        #     machine.entropy()
+            # sys.stdout.write('.'); sys.stdout.flush()
+    # print()
+
+    if False:
+        profile.print_stats(sort='cumtime')
 
     print("Training complete, Begining evaluation phase...")
 
-    print('duty cycle min ',  np.min(machine.average_activations) * 100, '%')
-    print('duty cycle mean', np.mean(machine.average_activations) * 100, '%')
-    print('duty cycle std ',  np.std(machine.average_activations) * 100, '%')
-    print('duty cycle max ',  np.max(machine.average_activations) * 100, '%')
-
-    # Evaluate the classifier
     score = 0
     all_pred = set()
     for img, lbl in test_data:
-        if True:
-            img_enc = np.squeeze(enc.encode(img))
-            state = machine.compute(img_enc, learn=False)
-            prediction = np.argmax(sdrc.predict(state))
-        else:
-            # Test Random Performance
-            prediction = np.argmax(np.random.random(class_shape))
+        img_enc = np.squeeze(enc.encode(img))
+        state = machine.compute(img_enc, learn=False)
+        prediction = np.argmax(sdrc.predict(state))
         all_pred.add(prediction)
         if prediction == lbl:
             score += 1
     print("Score", score, '/', len(test_data))
     print("Predicted Classes", all_pred)    # Sanity check
-    end_time = time.time()
-    print("Compute time %g seconds"%(compute_time / train_cycles))
-    print("Elapsed time %g seconds"%(end_time - start_time))
 
     # Show Diagnostics for a sample input
-    # First run a sample input through the pipeline to setup the debug variables.
-    state = machine.compute(rand_imgs_enc[0])   # Learning enabled + boosting
-    from matplotlib import pyplot as plt
-    plt.figure(1)
-    plt.subplot(2, 3, 1)
-    plt.imshow(np.dstack([rand_imgs[0]]*3)/255., interpolation='nearest')
-    plt.title("Input Image")
+    state = machine.compute(rand_imgs_enc[0], diag=True)   # Learning & boosting enabled
 
-    plt.subplot(2, 3, 2)
-    plt.imshow(machine.zz_raw, interpolation='nearest')
-    plt.title('Raw Excitement, radius' + str(radii))
+    # machine.proximal.synapse_histogram(diag=True)
+    # machine.proximal.permanence_histogram(diag=True)
 
-    plt.subplot(2, 3, 3)
-    plt.imshow(machine.average_activations.reshape(col_shape), interpolation='nearest')
-    plt.title('Average Duty Cycle (alpha = %g)'%machine.average_activations_alpha)
-
-    plt.subplot(2, 3, 4)
-    plt.imshow(machine.zz_boostd.reshape(col_shape), interpolation='nearest')
-    plt.title('Boosted')
-
-    plt.subplot(2, 3, 5)
-    plt.imshow(machine.zz_norm, interpolation='nearest')
-    plt.title('Locally Inhibited Excitement')
-
-    plt.subplot(2, 3, 6)
-    active_state_visual = np.zeros(col_shape)
-    active_state_visual[state] = 1
-    plt.imshow(np.dstack([active_state_visual]*3), interpolation='nearest')
-    plt.title("Active Columns (%d train cycles)"%machine.age)
-
-    # Plot Robustness index
     if plot_noise_robustness:
         x1, y1 = machine.noise_robustness(rand_imgs_enc)
         plt.figure(2)
         plt.plot(x0, y0, 'r', x1, y1, 'g')
-        plt.title("Robustness. Red is before, Green is after training %d cycles"%machine.age)
+        # plt.title("Noise Robustness. Red is before, Green is after training %d cycles"%machine.age)
 
     # Show a table of SP inputs & outputs
-    if False:
-        examples = 5    # This many rows of examples, one example per row
-        cols = 4        # This many columns
-        plt.figure(3)
+    if True:
+        examples = 4    # This many rows of examples, one example per row
+        cols = 6        # This many columns
+        plt.figure(instance_tag + ' examples')
         for row in range(examples):
             for sub_col in range(int(cols / 2)):
                 img, lbl = random.choice(test_data)
                 img_enc = np.squeeze(enc.encode(img))
                 state = machine.compute(img_enc, learn=False)   # No boosting here!
+                prediction = np.argmax(sdrc.predict(state))
                 plt.subplot(examples, cols, row*cols + sub_col*2 + 1)
                 plt.imshow(np.dstack([img]*3)/255., interpolation='nearest')
                 plt.title("Label: %s"%lbl)
@@ -257,20 +304,25 @@ def MNIST_test(r, t):
                 state_visual[state] = 1
                 plt.subplot(examples, cols, row*cols + sub_col*2 + 2)
                 plt.imshow(np.dstack([state_visual]*3), interpolation='nearest')
-                plt.title("Active Columns")
+                plt.title("Classification %d"%prediction)
 
+    end_time = time.time()
+    if train_cycles:
+        print("Compute time %g seconds"%(compute_time / train_cycles))
+    print("Elapsed time %g seconds"%(end_time - start_time))
     plt.show()
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-r', '--radius', type=float, default=3)
+    parser.add_argument('-r', '--radius', type=float, default=4)
+    parser.add_argument('-p', '--potential_pool', type=float, default=238)
     parser.add_argument('-t', '--time', type=float, default=1.0)
-    parser.add_argument('--note', type=str)
+    parser.add_argument('--tag',  type=str)
     args = parser.parse_args()
 
-    if args.note:
-        print()
-        print(args.note)
-    MNIST_test(r=args.radius, t=args.time)
+    if args.tag:
+        SaveLoad.tag = args.tag
+
+    MNIST_test(r=args.radius, t=args.time, pp=args.potential_pool)
