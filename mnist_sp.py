@@ -2,9 +2,6 @@
 # Written by David McDougall, 2017
 
 from htm import *
-from matplotlib import pyplot as plt
-import time
-import cProfile
 
 
 def load_mnist():
@@ -60,7 +57,7 @@ def load_mnist():
     return train_labels, train_images, test_labels, test_images
 
 
-# TODO: Synthesize needs random scaling...
+# TODO: Synthesize should randomly stretch/scale/skew images.
 def synthesize(seed, diag=False):
     """
     Modify an image with random shifts, scales, and rotations.
@@ -130,7 +127,7 @@ class MNIST_Parameters(GA_Parameters):
             column_dimensions   = (1.216e+02, 1.274e+02),
             radii               = (3.308e+00, 1.933e+00),
             potential_pool      = 1.173e+02,
-            sparsity            = 9.436e-01,
+            sparsity            = 1.047e-02,
             coincidence_inc     = 3.532e-02,
             coincidence_dec     = 1.069e-02,
             permanence_thresh   = 3.901e-01,
@@ -151,15 +148,12 @@ def evaluate(parameters):
 
     # Training Loop
     train_cycles = len(train_images) * 1/2
-    compute_time = 0
     for i in range(int(round(train_cycles))):
         img, lbl      = random.choice(training_data)
         img           = synthesize(img, diag=False)
         img_enc       = enc.encode(np.squeeze(img))
-        compute_start = time.time()
         state         = machine.compute(img_enc)
         sdrc.train(state, (lbl,))
-        compute_time  += time.time() - compute_start
 
     # Testing Loop
     score = 0
@@ -172,27 +166,11 @@ def evaluate(parameters):
     return score / len(test_data)
 
 
-if __name__ == '__main__':
-    genetic_algorithm(
-        MNIST_Parameters,
-        evaluate,
-        population_size                 = 10,
-        num_epochs                      = 5,
-        seed                            = False,
-        seed_mutations_per_parameter    = 20,
-        seed_mutation_percent           = 0.05,
-        mutation_probability            = 0.20,
-        mutation_percent                = 0.10,
-        filename                        = 'checkpoint',
-        num_processes                   = 7,
-        profile                         = True,
-    )
-    exit(0)
+if False:
+    # I'm keeping the following diagnostic code snippets just in case I ever
+    # need them.  They are old and may not work.
+    from matplotlib import pyplot as plt
 
-
-def MNIST_test(r=4, pp=240, t=1):
-    # Load and prepare the data
-    train_labels, train_images, test_labels, test_images = load_mnist()
     if False:
         # Experiment to test what happens when areas are not given meaningful
         # input.  Adds 2 pixel black border around image.  Also manually
@@ -207,6 +185,7 @@ def MNIST_test(r=4, pp=240, t=1):
             return new_images
         train_images = expand_images(train_images)
         test_images  = expand_images(test_images)
+
     if False:
         # Experiment to verify that input dimensions are handled correctly
         # If you enable this, don't forget to rescale the radii as well as the input.
@@ -214,79 +193,21 @@ def MNIST_test(r=4, pp=240, t=1):
         new_sz = (1, 4, 1)
         train_images = [zoom(im, new_sz, order=0) for im in train_images]
         test_images  = [zoom(im, new_sz, order=0) for im in test_images]
-    training_data = list(zip(train_images, train_labels))
-    test_data = list(zip(test_images, test_labels))
-
-    col_shape   = (56, 56)        # 92% Accuracy
-    col_shape   = (112, 112)      # 93% Accuracy
-    radii       = (r, r)
-    class_shape = (10,)
-
-    start_time = time.time()
-    enc     = BWImageEncoder(train_images[0].shape[:2])
-    machine = SpatialPooler(enc.output_shape, col_shape, radii, potential_pool=pp)
-    sdrc    = SDR_Classifier(col_shape, class_shape, 'index')
-
-    rand_imgs     = random.sample(test_images, 100)
-    rand_imgs_enc = [enc.encode(np.squeeze(q)) for q in rand_imgs]
-    plot_noise_robustness = False
-    if plot_noise_robustness:
-        x0, y0 = machine.noise_robustness(rand_imgs_enc)
-    print("Initialiation complete, Begining training phase...")
-
-    # The difference between x1 and x100 the training time is 79.86% and 81.19% accuracy...
-    # These things might be immune to overtraining.
-    train_cycles = int(round(len(train_images) * t))
-    compute_time = 0
-    profile = cProfile.Profile()
-    print("Training Time", train_cycles)
-    for i in range(train_cycles):
-        img, lbl = random.choice(training_data)
-        img = synthesize(img, diag=False)
-        compute_start = time.time()             # Includes time to encode input
-        img_enc = enc.encode(np.squeeze(img))
-        profile.enable()
-        state = machine.compute(img_enc)
-        sdrc.train(state, (lbl,))
-        profile.disable()
-        compute_time += time.time() - compute_start
-        modulus = 5000
-        # if i % modulus == modulus-1:
-        #     machine.entropy()
-            # sys.stdout.write('.'); sys.stdout.flush()
-    # print()
 
     if False:
-        profile.print_stats(sort='cumtime')
+        # Show Diagnostics for a sample input
+        state = machine.compute(rand_imgs_enc[0], diag=True)   # Learning & boosting enabled
+        machine.proximal.synapse_histogram(diag=True)
+        machine.proximal.permanence_histogram(diag=True)
 
-    print("Training complete, Begining evaluation phase...")
+        if plot_noise_robustness:
+            x1, y1 = machine.noise_robustness(rand_imgs_enc)
+            plt.figure(2)
+            plt.plot(x0, y0, 'r', x1, y1, 'g')
+            # plt.title("Noise Robustness. Red is before, Green is after training %d cycles"%machine.age)
 
-    score = 0
-    all_pred = set()
-    for img, lbl in test_data:
-        img_enc = np.squeeze(enc.encode(img))
-        state = machine.compute(img_enc, learn=False)
-        prediction = np.argmax(sdrc.predict(state))
-        all_pred.add(prediction)
-        if prediction == lbl:
-            score += 1
-    print("Score", score, '/', len(test_data))
-    print("Predicted Classes", all_pred)    # Sanity check
-
-    # Show Diagnostics for a sample input
-    state = machine.compute(rand_imgs_enc[0], diag=True)   # Learning & boosting enabled
-
-    # machine.proximal.synapse_histogram(diag=True)
-    # machine.proximal.permanence_histogram(diag=True)
-
-    if plot_noise_robustness:
-        x1, y1 = machine.noise_robustness(rand_imgs_enc)
-        plt.figure(2)
-        plt.plot(x0, y0, 'r', x1, y1, 'g')
-        # plt.title("Noise Robustness. Red is before, Green is after training %d cycles"%machine.age)
-
-    # Show a table of SP inputs & outputs
-    if True:
+    if False:
+        # Show a table of SP inputs & outputs
         examples = 4    # This many rows of examples, one example per row
         cols = 6        # This many columns
         plt.figure(instance_tag + ' examples')
@@ -305,24 +226,35 @@ def MNIST_test(r=4, pp=240, t=1):
                 plt.subplot(examples, cols, row*cols + sub_col*2 + 2)
                 plt.imshow(np.dstack([state_visual]*3), interpolation='nearest')
                 plt.title("Classification %d"%prediction)
-
-    end_time = time.time()
-    if train_cycles:
-        print("Compute time %g seconds"%(compute_time / train_cycles))
-    print("Elapsed time %g seconds"%(end_time - start_time))
     plt.show()
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-r', '--radius', type=float, default=4)
-    parser.add_argument('-p', '--potential_pool', type=float, default=238)
-    parser.add_argument('-t', '--time', type=float, default=1.0)
-    parser.add_argument('--tag',  type=str)
+    parser.add_argument('-n', '--processes',  type=int, default=7, 
+        help="Number of processes to use.")
+    parser.add_argument('-p', '--population', type=int, default=50)
+    parser.add_argument('-e', '--epochs',    type=int, default=1)
+    parser.add_argument('--seed',        type=bool, default=False,
+        help='If True, start a new population and ignore any saved checkpoints, '+
+             'if False then loads the latest checkpoint from file.')
+    parser.add_argument('--checkpoint',  type=str,  default='checkpoint',
+        help='What name to save the results by.')
     args = parser.parse_args()
 
-    if args.tag:
-        SaveLoad.tag = args.tag
-
-    MNIST_test(r=args.radius, t=args.time, pp=args.potential_pool)
+    genetic_algorithm(
+        MNIST_Parameters,
+        evaluate,
+        population_size                 = args.population,
+        num_epochs                      = args.epochs,
+        seed                            = args.seed,
+        seed_mutations_per_parameter    = 20,
+        seed_mutation_percent           = 0.05,
+        mutation_probability            = 0.20,
+        mutation_percent                = 0.10,
+        filename                        = args.checkpoint,
+        num_processes                   = args.processes,
+        profile                         = True,
+    )
+    exit(0)

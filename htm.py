@@ -344,15 +344,19 @@ def genetic_algorithm(parameter_class, evaluate_function,
     profile                         = False,):
     """
     Argument parameter_class ...
-    Argument evaluate_function ...
+    Argument evaluate_function ... If evaluate_function raises a ValueError then
+             this function will assume the indivual's parameters are at fault
+             and discards them from the population by setting their fitness to
+             negative infinity.  
+
     Argument population_size ...
     Argument numn_epochs ...
-    Argument seed ...
-
-    Argument seed_mutations_per_parameter ...
-    Argument seed_mutation_percent is the amount to mutate the seeds by.
     Argument mutation_probability ...
     Argument mutation_percent ...
+
+    Argument seed ...
+    Argument seed_mutations_per_parameter ...
+    Argument seed_mutation_percent is the amount to mutate the seeds by.
 
     Argument filename is passed to checkpoint() to save the results.
     Argument num_processes ...
@@ -434,6 +438,7 @@ def _genetic_algorithm_evaluate(individual, evaluate_function, profile):
     try:
         fitness = evaluate_function(individual)
     except ValueError:
+        print(str(individual))
         traceback.print_exc()
         fitness = float('-inf')
     if profile:
@@ -1811,7 +1816,7 @@ class SpatialPooler(SaveLoad):
         self.proximal.reset()   # Updates self.proximal.synapses w/ new threshold
 
         # Initialize to the target activation frequency/sparsity.
-        self.average_activations = np.full(self.num_columns, args.sparsity, dtype=np.float32)
+        self.average_activations = np.full(self.num_columns, args.sparsity, dtype=np.float)
         self.output = ()
 
     def compute(self, input_sdr, focus=None, learn=True, diag=False):
@@ -2225,41 +2230,35 @@ class SpatialPooler(SaveLoad):
         return '\n'.join(st)
 
 
-class SynapseManager_tp:
+
+# TODO: I think make_synapses will need more work...
+class SynapseManager_tm:
     """
     Incomplete, built for the Temporal Pooler class.
     Allows each output to have a different number of inputs.
     """
-    def __init__(self, input_dimensions, output_dimensions, diag=True):
+    def __init__(self, input_dimensions, output_dimensions,
+        permanence_inc,
+        permanence_dec,
+        permanence_thresh,):
         """
         Argument input_dimensions is tuple of input space dimensions
         Argument output_dimensions is tuple of output space dimensions
-        Argument radii is tuple of convolutional radii, must be same length as output_dimensions
-                 radii units are the input space units
-                 radii is optional, if not given assumes no topology
-        Argument potential_pool is the fraction of possible inputs to include in 
-                 each columns potential pool of input sources.  Default is .95
-
-        If output_dimensions is shorter than input_dimensions then the trailing
-        input_dimensions are not convolved over, are instead broadcast to all
-        outputs which are connected via the convolution in the other dimensions.
         """
-        self.input_dimensions   = tuple(input_dimensions)
-        self.output_dimensions  = tuple(output_dimensions)
-        self.num_inputs         = np.product(self.input_dimensions)
-        self.num_outputs        = np.product(self.output_dimensions)
-
-        self.coincidence_inc = 0.01
-        self.coincidence_dec = 0.001
-
-        self.permanence_threshold = 0.3
+        self.input_dimensions     = tuple(input_dimensions)
+        self.output_dimensions    = tuple(output_dimensions)
+        self.num_inputs           = np.product(self.input_dimensions)
+        self.num_outputs          = np.product(self.output_dimensions)
+        self.permanence_inc       = permanence_inc
+        self.permanence_dec       = permanence_dec
+        self.permanence_threshold = permanence_thresh
 
         # Both inputs and outputs are identified by their flat-index, which is
         # their index into their space after it's been flattened.  
 
         # self.sources[output-index][input-number] = input-index
         # self.sources.shape = (num_outputs, num_inputs)
-        self.sources     = [[] for out in range(self.num_outputs)]
+        self.sources     = np.empty(self.num_outputs, dtype=np.object)
         self.permanences = [[] for n in range(self.num_outputs)]
         self.synapses    = [[] for n in range(self.num_outputs)]
         self.reset()
@@ -2284,6 +2283,9 @@ class SynapseManager_tp:
                 true: it is the max fraction of output_set which each input 
                 connected to.
         """
+        # TODO: This might be premature, but I think that choosing which inputs
+        #       to connect is a job to the main TM class, this should just deal
+        #       with actually changing the synapses tables.  
         print(input_set)
         if not len(input_set) or (len(input_set.shape) > 1 and not len(input_set[0])):
             return
@@ -2330,9 +2332,7 @@ class SynapseManager_tp:
             dense = np.zeros(self.input_dimensions, dtype=np.bool)
             dense[input_activity] = True
             input_activity = dense
-        assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaksf
-
-        # TODO: This should really only compute excitements in the active columns...
+        assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaks
 
         # Gather the inputs, mask out disconnected synapses, and sum for excitements.
         self.input_activity = input_activity.reshape(-1)
@@ -2354,7 +2354,7 @@ class SynapseManager_tp:
         """
         for out in output_activity:
             updates = np.choose(self.inputs[out], 
-                                np.array([-self.coincidence_dec, self.coincidence_inc]))
+                                np.array([-self.permanence_dec, self.permanence_inc]))
             updates = np.clip(updates + self.permanences[out], 0.0, 1.0)
             self.permanences[out] = updates
             self.synapses[out]    = updates > self.permanence_threshold
@@ -2363,19 +2363,19 @@ class SynapseManager_tp:
 # TODO: Nupic TP details, segments learn if they are nearly predictive.
 # Currently segments only learn if they are predictive and in an active cell.
 
-# TODO: My TP is crap.  Use Nupic's TP instead.  My TP uses too much memory.  It
-# keeps stats on a random subset of the potential pool.  Instead only keep stats
-# on the synapses which are added when it bursts. 
-
-# Its not just about the bugs in mine either, theirs is more advanced and has a
-# full suite of unit tests.  They've even used theirs for basic sensorymotor 
-# inference demos.  Don't be reinventing shit.
+# TODO: This is written so that  it doesn't output predictions, which I really
+#       want for testing purposes and i mean Im going to have to compute them
+#       regardless its just on the other side of the compute cycle boundry.
+#       Compute early vs compute later...
 
 class TemporalMemoryParameters(GA_Parameters):
     parameters = [
         'cells_per_column',
         'segments_per_cell',
         'synapses_per_segmenmt',
+        'permanence_inc',
+        'permanence_dec',
+        'permanence_thresh',
         'predictive_threshold',     # Segment excitement threshold for predictions
         'learning_threshold',       # Segment excitement threshold for learning
         'burst_cells_to_connect',   # Fraction of unpredicted input to add to new segments.
@@ -2388,29 +2388,33 @@ class TemporalMemory:
     Neocortex. Frontiers in Neural Circuits 10:23 doi: 10.3389/fncir.2016.00023
     """
     def __init__(self, 
-        sp_parameters,
-        tp_parameters,):
+        parameters,
+        column_dimensions,):
         """
-        Argument sp_parameters is an instance of SpatialPoolerParameters
-        Argument tp_parameters is an instance of TemporalMemoryParameters
+        Argument parameters is an instance of TemporalMemoryParameters
+        Argument column_dimensions ...
         """
-        self.sp_args = sp_args   = sp_parameters
-        self.tp_args = tp_args   = tp_parameters
-        self.column_dimensions   = tuple(int(round(cd)) for cd in sp_args.column_dimensions)
-        self.cells_per_column    = int(round(tp_args.cells_per_column))
-        self.segments_per_cell   = int(round(tp_args.segments_per_cell))
+        self.args = args         = parameters
+        self.column_dimensions   = tuple(int(round(cd)) for cd in column_dimensions)
+        self.cells_per_column    = int(round(args.cells_per_column))
+        self.segments_per_cell   = int(round(args.segments_per_cell))
         self.num_columns         = np.product(self.column_dimensions)
         self.num_neurons         = self.cells_per_column * self.num_columns
         self.output_shape        = (self.num_columns, self.cells_per_column)
         self.anomaly_alpha       = .001
         self.mean_anomaly        = 1.0
-        self.basal               = SynapseManager_tp(input_dimensions,
-                                    (self.num_columns, self.cells_per_column, self.segments_per_cell),
-                                    # potential_pool=potential_pool,
-                                    diag=diag)
+        input_dimensions         = (self.num_columns, self.cells_per_column, self.segments_per_cell,)
+        self.basal               = SynapseManager_tm(input_dimensions, input_dimensions,
+            permanence_inc       = args.permanence_inc,
+            permanence_dec       = args.permanence_dec,
+            permanence_thresh    = args.permanence_thresh,)
         self.reset()
 
     def reset(self):
+        # TODO: Why is excitement an attribute?
+        #       The excitment needs to stick around because besides active cells
+        #       there are learning segments which may be sub activation threshold
+        #       but still qualify...
         self.excitement = np.zeros((self.num_columns, self.cells_per_column, self.segments_per_cell))
         self.active = np.empty((2, 0), dtype=np.int)
 
@@ -2419,6 +2423,7 @@ class TemporalMemory:
         Argument column_activations is an index of active columns.
 
         Returns active neurons as pair (flat-column-index, neuron-index)
+                This is also stored as the attribute 'active'
         """
         # Flatten the input column indecies
         columns = np.ravel_multi_index(column_activations, self.column_dimensions)
@@ -2430,7 +2435,7 @@ class TemporalMemory:
         self.excitement = self.excitement.reshape(( self.num_columns, 
                                                     self.cells_per_column, 
                                                     self.segments_per_cell))
-        predictive_segemnts = self.excitement[columns] > self.tp_args.predictive_threshold
+        predictive_segemnts = self.excitement[columns] > self.args.predictive_threshold
 
         # Learn to better predict future activity.  Reinforce all segments which
         # correctly predicted an active column.  
@@ -2510,21 +2515,6 @@ class TemporalMemory:
             plt.ylabel("Percent of segments")
             plt.axvline(self.predictive_threshold, color='r')
             # plt.show()
-        return hist, bins
-
-    def duty_cycle_histogram(self, diag=True):
-        """Note: diag does NOT show the figure! use plt.show()"""
-        data = self.activation_frequency.flatten()
-        hist, bins = np.histogram(data,
-                        bins=500, 
-                        density=False)
-        if diag:
-            import matplotlib.pyplot as plt
-            plt.figure(instance_tag + ' TP Duty Cycle')
-            plt.plot(bins[:-1], hist)
-            plt.title("Histogram of Neuron Duty Cycles")
-            plt.xlabel("Duty Cycle")
-            plt.ylabel("Number of Neurons")
         return hist, bins
 
 

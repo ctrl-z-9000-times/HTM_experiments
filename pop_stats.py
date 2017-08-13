@@ -10,13 +10,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument('checkpoint_filename', type=str)
 args = parser.parse_args()
 
-pop = pickle.load(open(args.checkpoint, 'rb'))
+pop = pickle.load(open(args.checkpoint_filename, 'rb'))
 
 if False:
     print("REMOVING ATTRIBUTE FITNESS")
     for indv in pop:
         indv.fitness = None
-    pickle.dump(pop, open(args.checkpoint, 'wb'))
+    pickle.dump(pop, open(args.checkpoint_filename, 'wb'))
 
 type(pop[0]).pprint_population_statistics(pop)
 print()
