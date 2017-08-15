@@ -12,11 +12,9 @@ import sys
 import os, os.path
 import re
 import cv2
-import copy
 import PIL, PIL.ImageDraw
-import multiprocessing as mp
-import cProfile, pstats, tempfile
-import traceback
+from genetics import Parameters
+
 
 def random_tag(length=2):
     return ''.join(chr(ord('A') + random.randrange(26)) for _ in range(length))
@@ -77,382 +75,9 @@ class SaveLoad:
         return self
 
 
-def checkpoint(population, generation, filename='checkpoint'):
-    """
-    Saves/Loads the population from file.
-
-    Folder is name of program + "_data/".
-    Filename is "checkpoint.[GENERATION].pop"
-
-    If the population is empty and there is a checkpoint on file then the
-    latest checkpoint is returned as a pair of (population, generation).
-    Otherwise this returns the given (population, generation).
-    """
-    program, ext  = os.path.splitext(sys.argv[0])
-    path, program = os.path.split(program)
-    folder        = os.path.join(path, program + '_data')
-
-    def save(pop, gen, filename):
-        filename_ext = filename + '.' + str(gen) + '.pop'
-        full_filename = os.path.join(folder, filename_ext)
-        try:
-            os.makedirs(folder)
-        except OSError:
-            pass
-        pickle.dump(pop, open(full_filename, 'wb'))
-
-    def max_gen(filename):
-        """Returns pair of (filename, generation)"""
-        matches = []
-        for fn in os.listdir(folder):
-            fn_format = r'^' + filename + r'\.(\d+)\.pop$'
-            m = re.match(fn_format, fn)
-            if m:
-                gen = int(m.groups()[0])
-                fn  = os.path.join(folder, fn)
-                matches.append((fn, gen))
-        try:
-            return max(matches, key=lambda p: p[1])
-        except ValueError:
-            return None, -1
-
-    if len(population):
-        save(population, generation, filename)
-        return population, generation
-    else:
-        filename, latest_gen = max_gen(filename)
-        if filename is not None and latest_gen >= 0:
-            return pickle.load(open(filename, 'rb')), latest_gen
-        else:
-            return population, generation
-
-
-class GA_Parameters:
-    """
-    Abstract parent class for genetic material.  Child classes represent
-    parameters for a specific type of object.  The purpose of this class is to
-    facilitate a parameter search, for example a genetic algorithm or swarming.
-
-    Class attribute parameters is the list of attributes which make up the 
-    mutable parameters, all other attributes are ignored by this class and its
-    methods.  The type of these attributes must be one of:
-        1) Floating point number
-        2) Tuple of floating point numbers
-        3) Instance of GA_Parameters or a child class.
-    """
-    parameters = []
-
-    def __init__(self, **kw_args):
-        """
-        Child classes override this as needed.  This writes all keyword
-        arguments into the new instance as its initial values.
-        """
-        p_set = set(self.parameters)
-        for attr, value in kw_args.items():
-            if attr not in p_set:
-                raise TypeError("'%s' is not a valid keyword argument to this class"%attr)
-            setattr(self, attr, value)
-
-    def mutate(self, percent=0.25):
-        """
-        Randomly change a single parameter by at most the given percent.
-        Default maximum mutation is 25%
-        """
-        # Pick a parameter to mutate and get its value.
-        def attr_probability(attr):
-            """This assigns all attributes uniform probability of mutation."""
-            value = getattr(self, attr)
-            if isinstance(value, GA_Parameters):
-                return len(value)
-            elif isinstance(value, tuple):
-                return len(value)
-            elif value is None:
-                return 0    # Don't try to mutate attributes which are set to None.
-            else:
-                return 1
-        probabilities   = [attr_probability(attr) for attr in self.parameters]
-        probabilities   = np.array(probabilities) / np.sum(probabilities)
-        param_idx       = np.random.choice(len(self.parameters), p=probabilities)
-        param           = self.parameters[param_idx]
-        value           = getattr(self, param)
-        if isinstance(value, GA_Parameters):
-            value.mutate(percent)
-        else:
-            modifier = (1 - percent) + 2 * percent * random.random()
-            if isinstance(value, tuple):
-                # Mutate a random element of tuple
-                index    = random.randrange(len(value)) # Pick an element to mutate
-                new_elem = value[index] * modifier      # All elements are treated as floating point
-                # Swap the new element into the tuple.
-                new_value = tuple(new_elem if i==index else elem for i, elem in enumerate(value))
-                setattr(self, param, new_value)
-            else:
-                # Mutate a floating point number
-                new_value = value * modifier
-                if not ((new_value >= 0) == (value >= 0 )):
-                    print(value, new_value, percent)
-                setattr(self, param, new_value)
-
-    def crossover(self, other):
-        """Child is built from a shallow copy of self."""
-        child   = copy.copy(self)
-        sources = [self, other]
-        for param in self.parameters:
-            values = [getattr(obj, param) for obj in sources]
-            if isinstance(values[0], GA_Parameters):
-                child_value = values[0].crossover(values[1])
-            elif isinstance(values[0], tuple):
-                child_value = tuple(random.choice(elem) for elem in zip(*values))
-            else:
-                child_value = random.choice(values)
-            setattr(child, param, child_value)
-        child.fitness = None
-        return child
-
-    def __len__(self):
-        accum = 0
-        for attr in self.parameters:
-            value = getattr(self, attr)
-            if isinstance(value, GA_Parameters):
-                accum += len(value)
-            elif isinstance(value, tuple):
-                accum += len(value)
-            elif value is None:
-                pass
-            else:
-                accum += 1
-        return accum
-
-    def __str__(self):
-        indent    = 2
-        header    = [type(self).__name__]
-        table     = []
-        max_name  = max(len(nm) for nm in self.parameters)
-        for attr in sorted(self.parameters):
-            pad   = max_name - len(attr) + 2
-            value = str(getattr(self, attr, None))
-            if '\n' in value:
-                value = value.replace('\n', '\n'+' '*indent)
-                value = value.split('\n', maxsplit=1)[1]      # Hacks
-                table.append(' '*indent + attr +'\n'+ value)
-            else:
-                table.append(' '*indent + attr +' '+ '.'*pad +' '+ value)
-        table.sort(key = lambda ln: '\n' in ln)
-        table = '\n'.join(table)
-
-        # Make all of the columns line up.
-        align_to = max(len(entry) for entry in re.findall(r"^.*\.\.\s", table, re.MULTILINE))
-        aligned_table = []
-        for line in table.split('\n'):
-            match = re.match(r"(^.*\.\.\s)", line, re.MULTILINE)
-            if match is not None:
-                extend = align_to - len(match.group())
-                line = line.replace('.. ', '.'*extend + '.. ')
-            aligned_table.append(line)
-        return '\n'.join(header + aligned_table)
-
-    @classmethod
-    def population_statistics(cls, population):
-        """
-        Finds the population wide minimum, mean, standard-deviation, and
-        maximumn of all parameters.  The special attribute 'fitness' is included
-        if it is present and not None.  
-
-        Argument population is list of instances of GA_Parameters or a child 
-                 class.
-
-        Returns dictionary of {parameter: statistics}
-                If parameter refers to a tuple, it is replace with a parameter
-                for each element.  If parameter refers to a nested GA_Parameters
-                instance then the full path to the parameter is used with a dot
-                seperating each parameter name, as in "indv.sensor.encoder.attr".
-                Statistics are tuples of (min, mean, std, max).
-        """
-        table = {}
-        if not population:
-            return table
-        attribute_list = cls.parameters
-        if all(getattr(indv, 'fitness', None) is not None for indv in population):
-            attribute_list = attribute_list[:] + ['fitness']
-        for attr in attribute_list:
-            data       = [getattr(indv, attr) for indv in population]
-            data_types = set(type(v) for v in data)
-            if int in data_types and float in data_types:
-                data_types.remove(int)  # Integers are not part of the spec but are OK.
-            if len(data_types) != 1:
-                raise TypeError("Not one data type for attribute '%s', found %s"%(attr, data_types))
-            data_type  = data_types.pop()
-            if issubclass(data_type, GA_Parameters):
-                nested = data_type.population_statistics(data)
-                for nested_parameter, nested_value in nested.items():
-                    table[attr + '.' + nested_parameter] = nested_value
-            elif data_type == type(None):
-                table[attr] = (None, None, None, None)
-            elif data_type == tuple:
-                for index, elem in enumerate(zip(*data)):
-                    table[attr + '[%d]'%index] = (
-                        np.min(elem),
-                        np.mean(elem),
-                        np.std(elem),
-                        np.max(elem),)
-            else:
-                table[attr] = (
-                    np.min(data),
-                    np.mean(data),
-                    np.std(data),
-                    np.max(data),)
-        return table
-
-    @classmethod
-    def pprint_population_statistics(cls, population, file=sys.stdout):
-        if not population:
-            output = "Population is empty."
-            if file is not None:
-                file.write(output)
-            return output
-        table = cls.population_statistics(population)
-        entries = list(table.items())
-        entries.sort(key = lambda entry: entry[0])
-        # Push fitness to either the top of the bottom of the table.
-        is_fitness = lambda param_stat: param_stat[0].endswith('fitness')
-        fitness    = [row for row in entries if     is_fitness(row)]
-        entries    = [row for row in entries if not is_fitness(row)]
-        entries    += fitness
-        lines      = ["Population Statistics for %d %s"%(len(population), cls.__name__)]
-        max_name   = max(len(nm) for nm in table.keys()) + 2
-        name = 'Parameter'
-        lines.append(name+' '+' '*(max_name - len(name))+' Min       | Mean      | Std       | Max')
-        for parameter, stats in entries:
-            stats = ['%.3e'%st for st in stats]
-            pad   = max_name - len(parameter)
-            lines.append(parameter+' '+'.'*pad+' '+' | '.join(stats))
-        output = '\n'.join(lines) + '\n'
-        if file is not None:
-            file.write(output)
-        return output
-
-def genetic_algorithm(parameter_class, evaluate_function,
-    population_size                 = 50,
-    num_epochs                      = 1,
-    seed                            = False,
-    seed_mutations_per_parameter    = 2,
-    seed_mutation_percent           = 0.025,
-    mutation_probability            = 0.10,
-    mutation_percent                = 0.25,
-    filename                        = 'checkpoint',
-    num_processes                   = 7,
-    profile                         = False,):
-    """
-    Argument parameter_class ...
-    Argument evaluate_function ... If evaluate_function raises a ValueError then
-             this function will assume the indivual's parameters are at fault
-             and discards them from the population by setting their fitness to
-             negative infinity.  
-
-    Argument population_size ...
-    Argument numn_epochs ...
-    Argument mutation_probability ...
-    Argument mutation_percent ...
-
-    Argument seed ...
-    Argument seed_mutations_per_parameter ...
-    Argument seed_mutation_percent is the amount to mutate the seeds by.
-
-    Argument filename is passed to checkpoint() to save the results.
-    Argument num_processes ...
-    Argument profile ...
-    """
-    population    = []
-    generation    = 0
-    profile_stats = []
-    if seed:
-        # Make the initial population
-        print("SEEDING WITH %d"%population_size)
-        for _ in range(population_size):
-            indv = parameter_class()
-            for mut in range(int(round(seed_mutations_per_parameter * len(indv)))):
-                indv.mutate(seed_mutation_percent)
-            population.append(indv)
-    # Run the Genetic Algorithm
-    for epoch in range(num_epochs):
-        population, generation = checkpoint(population, generation, filename)
-        print("CHECKPOINT %d, POP SZ %d, %s"%(generation, len(population), filename))
-        # Generate new parameters and new combinations of parameters.
-        for _ in range(population_size):
-            p1, p2 = random.sample(population, 2)
-            chd = p1.crossover(p2)
-            if random.random() < mutation_probability:
-                chd.mutate(mutation_percent)
-            population.append(chd)
-        # Evaluate each individual
-        eval_list = [indv for indv in population if getattr(indv, 'fitness', None) is None]
-        eval_args = [(indv, evaluate_function, profile) for indv in eval_list]
-        with mp.Pool(num_processes) as procpool:
-            results = procpool.starmap(_genetic_algorithm_evaluate, eval_args)
-        # Deal with the results of the evaluations.
-        if profile:
-            fitness_list, profiles = zip(*results)
-            profile_stats.extend(profiles)
-        else:
-            fitness_list = results
-        for indv, fit in zip(eval_list, fitness_list):
-            indv.fitness = fit          # Put the fitnesses where they belong.
-        # Cull the population down to size.
-        population.sort(key=lambda indv: indv.fitness, reverse=True)
-        population = population[:population_size]
-        generation += 1
-        print("Mean fitness %g"%(sum(indv.fitness for indv in population)/len(population)))
-
-    if profile:
-        # Assemble each evaluation's profile into one big profile and print it.
-        stats = pstats.Stats(*profile_stats)
-        stats.sort_stats('time')
-        stats.print_stats()
-        for tempfile in profile_stats:
-            os.remove(tempfile)     # Clean up
-
-    population, generation = checkpoint(population, generation, filename)
-    print("SUMMARY FOR GENERATION %d, %s"%(generation, filename))
-    parameter_class.pprint_population_statistics(population)
-    print()
-    for indv in population:
-        print(str(indv))
-        if getattr(indv, 'fitness', None) is not None:
-            print("Fitness", indv.fitness)
-        else:
-            print("Fitness not yet evaluated...")
-        print()
-    return population, generation
-
-def _genetic_algorithm_evaluate(individual, evaluate_function, profile):
-    """
-    This function is executed in a subprocess.
-
-    Argument profile ... is boolean, causes this to return tuple of (fitness,
-             stats_file) where stats_file is a temporary file containing the
-             binary pstats.Stats() output of the profiler.
-    """
-    if profile:
-        pr = cProfile.Profile()
-        pr.enable()
-    try:
-        fitness = evaluate_function(individual)
-    except ValueError:
-        print(str(individual))
-        traceback.print_exc()
-        fitness = float('-inf')
-    if profile:
-        pr.disable()
-        stats_file = tempfile.NamedTemporaryFile(delete=False)
-        pr.dump_stats(stats_file.name)
-        return fitness, stats_file.name
-    else:
-        return fitness
-
-
 # TODO: This should use or at least print the radius, ie the distance at which
 # two numbers will have 50% overlap.  Radius is a replacement for resolution.
-class RandomDistributedScalarEncoderParameters(GA_Parameters):
+class RandomDistributedScalarEncoderParameters(Parameters):
     parameters = [
         "resolution",
         "size",
@@ -468,13 +93,14 @@ class RandomDistributedScalarEncoder:
     def __init__(self, parameters):
         self.args = args    = parameters
         self.size           = int(round(args.size))
+        self.on_bits        = int(round(args.size * args.sparsity))
         self.output_shape   = (int(round(self.size)),)
 
     def encode(self, value):
         # This must be integer division! Everything under the resolution must be removed.
         index = value // self.args.resolution
         code = np.zeros(self.output_shape, dtype=np.bool)
-        for offset in range(self.args.on_bits):
+        for offset in range(self.on_bits):
             # Cast to string before hash, python3 will not hash an integer, uses
             # value instead.
             h = hash(str(index + offset))
@@ -545,7 +171,7 @@ class BWImageEncoder:
         return np.dstack([on_bits, off_bits])
 
 
-class ChannelEncoderParameters(GA_Parameters):
+class ChannelEncoderParameters(Parameters):
     parameters = [
         'num_samples',
         'sparsity',
@@ -560,7 +186,6 @@ class ChannelEncoderParameters(GA_Parameters):
         """
         self.num_samples  = num_samples
         self.sparsity     = sparsity
-
 
 # TODO: Measure the output sparsity
 class ChannelEncoder:
@@ -640,7 +265,7 @@ class ChannelEncoder:
         return '\n'.join(lines)
 
 
-class ChannelThresholderParameters(GA_Parameters):
+class ChannelThresholderParameters(Parameters):
     parameters = [
         'channel',
         'mean',
@@ -695,7 +320,7 @@ class ChannelThresholder:
         return sdr
 
 
-class EyeSensorParameters(GA_Parameters):
+class EyeSensorParameters(Parameters):
     parameters = [
         # Retina Parameters
         'eye_dimensions',
@@ -784,7 +409,6 @@ class EyeSensorParameters(GA_Parameters):
         del kw_args['self']
         del kw_args['__class__']
         super().__init__(**kw_args)
-
 
 class EyeSensor:
     """
@@ -1052,8 +676,20 @@ class EyeSensor:
 
     def new_image(self, image, diag=False):
         if isinstance(image, str):
-            image = np.array(PIL.Image.open(image))
-        self.image = image
+            self.image_file = image
+            self.image = np.array(PIL.Image.open(image))
+        else:
+            self.image_file = None
+            self.image = image
+        # Get the image into the right format.
+        if self.image.dtype != np.uint8:
+            raise TypeError('Image %s dtype is not unsigned 8 bit integer, image.dtype is %s.'%(
+                    '"%s"'%self.image_file if self.image_file is not None else 'argument',
+                    self.image.dtype))
+        self.image = np.squeeze(self.image)
+        if len(self.image.shape) == 2:
+            self.image = np.dstack([self.image] * 3)
+
         self.preprocess_edges()
         self.randomize_view()
 
@@ -1061,13 +697,6 @@ class EyeSensor:
             plt.figure('Image')
             plt.title('Image')
             plt.imshow(self.image, interpolation='nearest')
-            # Show edges
-            # plt.subplot(2, 2, 3)
-            # plt.imshow(np.dstack([input_space[-2]]*3), interpolation='nearest')
-            # plt.title('Y Sobel')
-            # plt.subplot(2, 2, 4)
-            # plt.imshow(np.dstack([input_space[-1]]*3), interpolation='nearest')
-            # plt.title('X Sobel')
             plt.show()
 
     def preprocess_edges(self):
@@ -1698,8 +1327,7 @@ class SynapseManager:
             # plt.show()
         return hist, bins
 
-
-class SpatialPoolerParameters(GA_Parameters):
+class SpatialPoolerParameters(Parameters):
     parameters = [
         "column_dimensions",
         "radii",
@@ -1716,7 +1344,7 @@ class SpatialPoolerParameters(GA_Parameters):
         coincidence_dec     = 0.01,
         permanence_thresh   = 0.4,
         radii               = None,
-        potential_pool      = 1024,
+        potential_pool      = None,
         sparsity            = 0.02,
         boosting_alpha      = 0.001, ):
         """
@@ -1740,7 +1368,6 @@ class SpatialPoolerParameters(GA_Parameters):
         del kw_args['self']
         del kw_args['__class__']
         super().__init__(**kw_args)
-
 
 class SpatialPooler(SaveLoad):
     """
@@ -2230,151 +1857,14 @@ class SpatialPooler(SaveLoad):
         return '\n'.join(st)
 
 
-
-# TODO: I think make_synapses will need more work...
-class SynapseManager_tm:
-    """
-    Incomplete, built for the Temporal Pooler class.
-    Allows each output to have a different number of inputs.
-    """
-    def __init__(self, input_dimensions, output_dimensions,
-        permanence_inc,
-        permanence_dec,
-        permanence_thresh,):
-        """
-        Argument input_dimensions is tuple of input space dimensions
-        Argument output_dimensions is tuple of output space dimensions
-        """
-        self.input_dimensions     = tuple(input_dimensions)
-        self.output_dimensions    = tuple(output_dimensions)
-        self.num_inputs           = np.product(self.input_dimensions)
-        self.num_outputs          = np.product(self.output_dimensions)
-        self.permanence_inc       = permanence_inc
-        self.permanence_dec       = permanence_dec
-        self.permanence_threshold = permanence_thresh
-
-        # Both inputs and outputs are identified by their flat-index, which is
-        # their index into their space after it's been flattened.  
-
-        # self.sources[output-index][input-number] = input-index
-        # self.sources.shape = (num_outputs, num_inputs)
-        self.sources     = np.empty(self.num_outputs, dtype=np.object)
-        self.permanences = [[] for n in range(self.num_outputs)]
-        self.synapses    = [[] for n in range(self.num_outputs)]
-        self.reset()
-
-    def reset(self):
-        # Zero the input space
-        self.inputs = [[False for inp in range(len(self.sources[out]))]
-                                            for out in range(self.num_outputs)]
-        # Refresh synapses too, incase it got modified and never updated
-        thresh = self.permanence_threshold
-        self.synapses = [[p > thresh for p in p_list]
-                                        for p_list in self.permanences]
-
-    def make_synapses(self, input_set, output_set, percent_connected):
-        """
-        Attempts to add new synapses to the potential pool.
-
-        Argument input_set is index into input space.
-        Argument output_set is index into output space.
-        Argument percent_connected is the maximum fraction of input_set which 
-                is connected to each output in output_set.  The opposite is also
-                true: it is the max fraction of output_set which each input 
-                connected to.
-        """
-        # TODO: This might be premature, but I think that choosing which inputs
-        #       to connect is a job to the main TM class, this should just deal
-        #       with actually changing the synapses tables.  
-        print(input_set)
-        if not len(input_set) or (len(input_set.shape) > 1 and not len(input_set[0])):
-            return
-
-        # Make input sparse
-        if isinstance(input_set, np.ndarray) and input_set.shape == self.input_dimensions:
-            input_set = np.nonzero(input_set)
-
-        # Flatten the input and output sets
-        inp = np.ravel_multi_index(input_set, self.input_dimensions)
-        out = np.ravel_multi_index(output_set, self.output_dimensions)
-
-        num_connections = int(round(percent_connected * self.num_inputs))
-        for site in out:
-            # Randomly select inputs which are not already connected to
-            existing_connections = set(self.sources[site])
-            for new_con in range(num_connections):
-                for x in range(10):    # Don't die friends
-                    source = random.choice(inp)
-                    if source not in existing_connections:
-                        # Add a new potential synapse
-                        self.sources[site].append( source )
-                        self.permanences[site] = np.append(self.permanences[site], random.random())
-                        synapse = self.permanences[site][-1] > self.permanence_threshold
-                        self.synapses[site] = np.append(self.synapses[site], synapse)
-                        existing_connections.add(source)
-                        break
-                else:
-                    # Could not find an unconnected input
-                    print("DEBUG, no unused inputs remaining")
-                    break
-
-    def compute(self, input_activity):
-        """
-        This uses the given presynaptic activity to determine the postsynaptic
-        excitment.
-
-        Returns the excitement as a flattened array.  
-                Reshape to output_dimensions if needed.
-        """
-        if isinstance(input_activity, tuple) or input_activity.shape != self.input_dimensions:
-            # It's significantly faster to make sparse inputs dense than to use
-            # np.in1d, especially since this does NOT discard inactive columns.
-            dense = np.zeros(self.input_dimensions, dtype=np.bool)
-            dense[input_activity] = True
-            input_activity = dense
-        assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaks
-
-        # Gather the inputs, mask out disconnected synapses, and sum for excitements.
-        self.input_activity = input_activity.reshape(-1)
-        self.inputs = []
-        excitments = []
-        for out in range(self.num_outputs):
-            inputs = np.take(self.input_activity, self.sources[out])
-            self.inputs.append(inputs)
-            connected_inputs = np.logical_and(self.synapses[out], inputs)
-            x = np.sum(connected_inputs)
-            excitments.append(x)
-        return excitments
-
-    def learn_outputs(self, output_activity):
-        """
-        Update permanences and then synapses.
-
-        Argument output_activity is index array
-        """
-        for out in output_activity:
-            updates = np.choose(self.inputs[out], 
-                                np.array([-self.permanence_dec, self.permanence_inc]))
-            updates = np.clip(updates + self.permanences[out], 0.0, 1.0)
-            self.permanences[out] = updates
-            self.synapses[out]    = updates > self.permanence_threshold
-
-
-# TODO: Nupic TP details, segments learn if they are nearly predictive.
-# Currently segments only learn if they are predictive and in an active cell.
-
-# TODO: This is written so that  it doesn't output predictions, which I really
-#       want for testing purposes and i mean Im going to have to compute them
-#       regardless its just on the other side of the compute cycle boundry.
-#       Compute early vs compute later...
-
-class TemporalMemoryParameters(GA_Parameters):
+class TemporalMemoryParameters(Parameters):
     parameters = [
         'cells_per_column',
         'segments_per_cell',
-        'synapses_per_segmenmt',
+        # 'synapses_per_segment',       # TODO
         'permanence_inc',
         'permanence_dec',
+        'mispredict_dec',
         'permanence_thresh',
         'predictive_threshold',     # Segment excitement threshold for predictions
         'learning_threshold',       # Segment excitement threshold for learning
@@ -2399,61 +1889,108 @@ class TemporalMemory:
         self.cells_per_column    = int(round(args.cells_per_column))
         self.segments_per_cell   = int(round(args.segments_per_cell))
         self.num_columns         = np.product(self.column_dimensions)
-        self.num_neurons         = self.cells_per_column * self.num_columns
+        # self.num_neurons         = self.cells_per_column * self.num_columns   # UNUSED?
         self.output_shape        = (self.num_columns, self.cells_per_column)
-        self.anomaly_alpha       = .001
-        self.mean_anomaly        = 1.0
-        input_dimensions         = (self.num_columns, self.cells_per_column, self.segments_per_cell,)
-        self.basal               = SynapseManager_tm(input_dimensions, input_dimensions,
-            permanence_inc       = args.permanence_inc,
-            permanence_dec       = args.permanence_dec,
-            permanence_thresh    = args.permanence_thresh,)
+        self.anomaly_alpha       = .1
+        self.mean_anomaly        = 0
+
+        # SYNAPSE MANAGER
+        self.input_dimensions     = (self.num_columns, self.cells_per_column,)
+        self.output_dimensions    = (self.num_columns, self.cells_per_column, self.segments_per_cell,)
+        self.num_inputs           = np.product(self.input_dimensions)
+        self.num_outputs          = np.product(self.output_dimensions)
+        self.permanence_inc       = self.args.permanence_inc
+        self.permanence_dec       = self.args.permanence_dec
+        self.permanence_threshold = self.args.permanence_thresh
+
+        self.sources     = np.empty((self.num_columns, self.cells_per_column, self.segments_per_cell,), dtype=object)
+        self.permanences = np.empty_like(self.sources)
+        for idx in np.ndindex(self.sources.shape):
+            self.sources[idx]     = np.zeros((0,), dtype=np.int)
+            self.permanences[idx] = np.zeros((0,), dtype=np.float)
         self.reset()
 
     def reset(self):
-        # TODO: Why is excitement an attribute?
-        #       The excitment needs to stick around because besides active cells
-        #       there are learning segments which may be sub activation threshold
-        #       but still qualify...
-        self.excitement = np.zeros((self.num_columns, self.cells_per_column, self.segments_per_cell))
-        self.active = np.empty((2, 0), dtype=np.int)
+        # Zero the input space
+        self.inputs = np.empty_like(self.sources)
+        for idx in np.ndindex(self.sources.shape):
+            self.inputs[idx] = np.zeros(self.sources[idx].shape, dtype=np.bool)
+
+        # Refresh synapses too, incase it got modified and never updated
+        threshold = self.permanence_threshold
+        self.synapses = np.empty_like(self.sources)
+        for idx in np.ndindex(self.sources.shape):
+            self.synapses[idx] = self.permanences[idx] > threshold
+
+        self.excitement  = np.zeros((self.num_columns, self.cells_per_column, self.segments_per_cell), dtype=np.int)
+        self.active      = np.empty((2, 0), dtype=np.int)
+        self.predictions = np.zeros((self.num_columns, self.cells_per_column), dtype=np.bool)
 
     def compute(self, column_activations):
         """
         Argument column_activations is an index of active columns.
 
         Returns active neurons as pair (flat-column-index, neuron-index)
-                This is also stored as the attribute 'active'
+
+        This sets the attributes anomaly and mean_anomaly.
         """
+        ########################################################################
+        # PHASE 1:  Determine the currently active neurons.
+        ########################################################################
         # Flatten the input column indecies
         columns = np.ravel_multi_index(column_activations, self.column_dimensions)
 
-        # Compute the predictions based on the previous timestep.
-        self.excitement = self.basal.compute( self.active )
-
-        # Get the correct predictions by taking just the active columns.
-        self.excitement = self.excitement.reshape(( self.num_columns, 
-                                                    self.cells_per_column, 
-                                                    self.segments_per_cell))
-        predictive_segemnts = self.excitement[columns] > self.args.predictive_threshold
-
-        # Learn to better predict future activity.  Reinforce all segments which
-        # correctly predicted an active column.  
-        col_num, neur_idx, seg_idx = np.nonzero(predictive_segemnts)
-        # Gets the actual column index, undoes the effect of discarding the
+        # Activate all neurons which are in a predictive state and in an active
+        # column.
+        active_dense      = self.predictions[columns]
+        col_num, neur_idx = np.nonzero(active_dense)
+        # This gets the actual column index, undoes the effect of discarding the
         # inactive columns before the nonzero operation.  
-        col_idx   = columns[col_num]
-        reinforce = (col_idx, neur_idx, seg_idx)
+        col_idx = columns[col_num]
+        active  = (col_idx, neur_idx)
 
         # If a column activates but was not predicted by any neuron segment,
         # then it bursts.  The bursting columns are the unpredicted columns.
         bursting_columns = np.setdiff1d(columns, col_idx)
+        # All neurons in bursting columns activate.
+        burst_col_idx  = np.repeat(bursting_columns, self.cells_per_column)
+        burst_neur_idx = np.tile(np.arange(self.cells_per_column), len(bursting_columns))
+        burst_active   = (burst_col_idx, burst_neur_idx)
+        active         = np.concatenate([active, burst_active], axis=1)
+
+        # Anomaly metric
+        self.anomaly = len(bursting_columns)/len(columns)
+        a = self.anomaly_alpha
+        self.mean_anomaly = (1-a)*self.mean_anomaly + a*self.anomaly
+
+        ########################################################################
+        # PHASE 2:  Learn about the previous to current timestep transition.
+        ########################################################################
+
+        # All segments which meet the learning threshold will learn.
+        learning_segments = self.excitement > self.args.learning_threshold
+
+        # All mispredicted segments receive a small permanence penalty (active
+        # segments in inactive columns)
+        inactive_columns = np.ones(self.num_columns, dtype=np.bool)
+        inactive_columns[columns] = False
+        mispredictions = learning_segments[inactive_columns]
+        # misprediction_index = np.ravel_multi_index(np.nonzero(mispredictions),
+        #     (len(inactive_columns), self.cells_per_column, self.segments_per_cell))
+        self.permanences[inactive_columns][mispredictions] -= self.args.mispredict_dec
+
+        # Reinforce all segments which correctly predicted an active column.  
+        col_num, neur_idx, seg_idx = np.nonzero(learning_segments[columns])
+        col_idx   = columns[col_num]
+        reinforce = (col_idx, neur_idx, seg_idx)
+
         if len(bursting_columns):
             # The most excited segment in each bursting column should learn to
             # recognise & predict this state.  First slice out just the bursting
             # columns.  Then flatten the neurons and segments together into 1
             # dimension for argmax to work with.
-            bursting_excitement = self.excitement[bursting_columns].reshape(len(bursting_columns), -1)
+            bursting_excitement = self.excitement[bursting_columns]
+            bursting_excitement = bursting_excitement.reshape(len(bursting_columns), -1)
             bursting_flat_idx   = np.argmax(bursting_excitement, axis=1)
             # Then unflatten the indecies to shape (neuron-index, segment-index)
             bursting_neurons, bursting_segments = np.unravel_index(bursting_flat_idx, 
@@ -2463,35 +2000,117 @@ class TemporalMemory:
             reinforce = np.concatenate([reinforce, reinforce_segments], axis=1)
 
         # Do this before adding any synapses
-        self.basal.learn_outputs(np.ravel_multi_index(reinforce, 
-                                                (self.num_columns, 
-                                                self.cells_per_column,
-                                                self.segments_per_cell)))
+        self.learn_outputs(reinforce)
 
         if len(bursting_columns):
             # Add synapses to the potential pool from a random subset of
-            # the active inputs to the bursting segments.
-            self.basal.make_synapses(self.active, reinforce_segments, .25)
+            # the previous timesteps activity to the bursting segments.
+            self.make_synapses(self.active, reinforce_segments, .25)
 
-        # TODO: In Nupic, all mispredicted segments receive a small permanence
-        # penalty (active segments in inactive columns)
+        ########################################################################
+        # PHASE 3:  Compute predictions for the next timestep and return.
+        ########################################################################
 
-        # Anomaly metric
-        self.anomaly = len(bursting_columns)
-        a = self.anomaly_alpha
-        self.mean_anomaly = (1-a)*self.mean_anomaly + a*self.anomaly/len(columns)
+        # Compute the predictions based on the current timestep.
+        self.excitement = self.compute_excitment( active )
+        self.excitement = self.excitement.reshape(( self.num_columns, 
+                                                    self.cells_per_column, 
+                                                    self.segments_per_cell))
 
-        # Determine which neurons activate.  All correctly predicted neurons
-        # activate.   I got rid of np.in1d in favor of dense storage which is
-        # faster.  When self.basal.compute turns self.active into a dense array,
-        # it will discard the duplicates but this functions return value does
-        # not!
-        active = (col_idx, neur_idx)
-        # All neurons in bursting columns activate.
-        burst_col_idx  = np.repeat(bursting_columns, self.neurons_per_column)
-        burst_neur_idx = np.tile(np.arange(self.neurons_per_column), len(bursting_columns))
-        self.active = np.concatenate([active, (burst_col_idx, burst_neur_idx)], axis=1)
-        return tuple(self.active)
+        self.predictions = np.any(self.excitement > self.args.predictive_threshold, axis=2)
+
+        self.active = tuple(active)    # Save this for the next timestep.
+        return self.predictions
+
+    def compute_excitment(self, input_activity):
+        """
+        This uses the given presynaptic activity to determine the postsynaptic
+        excitment.
+
+        Returns the excitement as a flattened array.  
+                Reshape to output_dimensions if needed.
+        """
+        if isinstance(input_activity, tuple) or input_activity.shape != self.input_dimensions:
+            # It's significantly faster to make sparse inputs dense than to use
+            # np.in1d, especially since this does NOT discard inactive columns.
+            dense = np.zeros(self.input_dimensions, dtype=np.bool)
+            dense[input_activity] = True
+            input_activity = dense
+        assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaks
+
+        # Gather the inputs, mask out disconnected synapses, and sum for excitements.
+        self.input_activity = input_activity.reshape(-1)
+        excitments = []
+        for out in np.ndindex(self.sources.shape):
+            assert(self.sources[out].dtype == np.int)
+            inputs = np.take(self.input_activity, self.sources[out])
+            self.inputs[out] = inputs
+            connected_inputs = np.logical_and(self.synapses[out], inputs)
+            x = np.sum(connected_inputs)
+            excitments.append(x)
+        return np.array(excitments)
+
+    def learn_outputs(self, output_activity):
+        """
+        Update permanences and then synapses.
+
+        Argument output_activity is index array
+        """
+        for out in zip(*output_activity):
+            if not len(self.inputs[out]):
+                continue    # Segment is empty...
+            updates = np.choose(self.inputs[out], 
+                                np.array([-self.permanence_dec, self.permanence_inc]))
+            updates = np.clip(updates + self.permanences[out], 0.0, 1.0)
+            self.permanences[out] = updates
+            self.synapses[out]    = updates > self.permanence_threshold
+
+    def make_synapses(self, input_set, output_index, percent_connected):
+        """
+        Attempts to add new synapses to the potential pool.
+
+        Argument input_set is index of previously active cells
+        Argument output_index is index of winning segments which need more synapses
+        Argument percent_connected is the maximum fraction of input_set which 
+                is connected to each output in output_set.  The opposite is also
+                true: it is the max fraction of output_set which each input 
+                connected to.
+        """
+        # if not len(input_set) or (len(input_set.shape) > 1 and not len(input_set[0])):
+        #     return
+
+        # Make input sparse
+        if isinstance(input_set, np.ndarray) and input_set.shape == self.input_dimensions:
+            input_set = np.nonzero(input_set)
+
+        # Flatten the input and output sets
+        inp = np.ravel_multi_index(input_set, self.input_dimensions)
+        if not len(inp):
+            return
+        # out = np.ravel_multi_index(output_index, self.output_dimensions)
+
+        num_connections = int(round(percent_connected * self.num_inputs))
+        for site in zip(*output_index):
+            # Randomly select inputs which are not already connected to
+            existing_connections = set(self.sources[site])
+            new_sources = []
+            for new_con in range(num_connections):
+                for retry in range(10):    # Don't die friends
+                    source = random.choice(inp)
+                    if source not in existing_connections:
+                        new_sources.append(source)
+                        existing_connections.add(source)
+                        break
+                else:
+                    # Could not find an unconnected input
+                    # print("DEBUG, no unused inputs remaining")
+                    break
+            # Add the new potential synapses
+            self.sources[site]     = np.concatenate([self.sources[site], np.array(new_sources, dtype=np.int)])
+            new_permanences        = np.random.random(len(new_sources))
+            self.permanences[site] = np.concatenate([self.permanences[site], new_permanences])
+            new_synapses           = new_permanences > self.permanence_threshold
+            self.synapses[site]    = np.concatenate([self.synapses[site], new_synapses])
 
     def excitement_histogram(self, diag=True):
         """
@@ -2518,7 +2137,7 @@ class TemporalMemory:
         return hist, bins
 
 
-class SDRC_Parameters(GA_Parameters):
+class SDRC_Parameters(Parameters):
     parameters = ['alpha',]
     def __init__(self, alpha=1/1000):
         self.alpha = alpha
@@ -2620,4 +2239,3 @@ class RandomOutputClassifier:
 
     def __str__(self):
         return "Random Output Classifier, Output shape is %s"%str(self.output_shape)
-

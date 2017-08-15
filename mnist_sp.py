@@ -2,7 +2,7 @@
 # Written by David McDougall, 2017
 
 from htm import *
-
+import genetics
 
 def load_mnist():
     """See: http://yann.lecun.com/exdb/mnist/ for MNIST download and binary file format spec."""
@@ -120,7 +120,7 @@ def synthesize(seed, diag=False):
     return synth
 
 
-class MNIST_Parameters(GA_Parameters):
+class MNIST_Parameters(genetics.Parameters):
     parameters = ['sp', 'sdrc',]
     def __init__(self,):
         self.sp = SpatialPoolerParameters(
@@ -243,7 +243,7 @@ if __name__ == '__main__':
         help='What name to save the results by.')
     args = parser.parse_args()
 
-    genetic_algorithm(
+    genetics.genetic_algorithm(
         MNIST_Parameters,
         evaluate,
         population_size                 = args.population,
