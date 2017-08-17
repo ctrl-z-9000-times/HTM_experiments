@@ -90,11 +90,23 @@ class Parameters:
         """
         Overwrites all parameters on this instance with the parents parameters.
         Modifies this class *IN PLACE*
+
+        Parent parameters which are None are not passed down to the child,
+        instead the child is left with its default for that parameter.
         """
+        # TODO: Insert type checks here?
         for attr in self.parameters:
-            values = [getattr(obj, attr) for obj in parents]
-            if isinstance(values[0], Parameters):
-                getattr(self, attr).crossover(parents)
+            no_value = object()
+            values   = [getattr(obj, attr, no_value) for obj in parents]
+            values   = [v for v in values if v is not no_value]
+            if not values:
+                # All parents are missing this attribute, leave child at default.
+                # This happens when a new parameter is added to an existing 
+                # population.  The children should get the new parameter and its
+                # defaults even though its not inherited from the parent.  
+                pass
+            elif isinstance(values[0], Parameters):
+                getattr(self, attr).crossover(values)
             else:
                 if isinstance(values[0], tuple):
                     child_value = tuple(random.choice(elem) for elem in zip(*values))
@@ -166,7 +178,7 @@ class Parameters:
             return table
         attribute_list = cls.parameters
         for attr in attribute_list:
-            data       = [getattr(indv, attr) for indv in population]
+            data       = [getattr(indv, attr, None) for indv in population]
             data_types = set(type(v) for v in data)
             if int in data_types and float in data_types:
                 data_types.remove(int)  # Integers are not part of the spec but are OK.
@@ -266,6 +278,22 @@ class Individual(Parameters):
             setattr(self, attr, None)
         self._fitness = None
 
+    def apply_eval_return(self, fitness_dict):
+        """
+        Convenience function to take the dictionary which the evaluate function
+        returns and assign it into attributes on this instance.
+
+        Argument fitness_dict must have the same keys as fitness_names_and_weights
+                 does, and its values are the fitnesses.  'None' can be used as
+                 a placeholder for missing values.  
+        """
+        # Check that evaluate_function returned a valid result.
+        if fitness_dict.keys() != self.fitness_names_and_weights.keys():
+            raise TypeError("Evaluate function returned dictionary which has missing/extra keys.")
+        # Put the fitnesses where they belong.
+        for attr_name, fitness in fitness_dict.items():
+            setattr(self, attr_name, fitness)
+
     @classmethod
     def population_fitness(cls, population):
         """Finds the min/mean/std/max of each component of fitness."""
@@ -318,6 +346,11 @@ class Individual(Parameters):
         return param_table + '\n' + fitness_table
 
 
+# NOTE: This could be made from a batch of jobs into a rolling queue of jobs.  
+#       There would not be distinct generations but it would be easier and
+#       more efficient to distribute jobs across many cores, (less waiting as
+#       the final job completes on the slowest node).  This is something I will
+#       want to do if I ever get a cluster of computers.  
 def genetic_algorithm(parameter_class, evaluate_function,
     population_size                 = 50,
     num_epochs                      = 1,
@@ -356,7 +389,6 @@ def genetic_algorithm(parameter_class, evaluate_function,
     Argument num_processes ...
     Argument profile ...
     """
-    assert(population_size >= 2)    # Can't/Won't reproduce asexually.
     population    = []
     generation    = 0
     profile_stats = []
@@ -369,44 +401,43 @@ def genetic_algorithm(parameter_class, evaluate_function,
                 indv.mutate(seed_mutation_percent)
             population.append(indv)
     # Run the Genetic Algorithm
-    for epoch in range(num_epochs):
-        population, generation = checkpoint(population, generation, filename)
-        print("CHECKPOINT %d, POP SZ %d, %s"%(generation, len(population), filename))
-        # Generate new parameters and new combinations of parameters.
-        for _ in range(population_size):
-            chd = parameter_class()
-            chd.crossover(random.sample(population, 2))
-            if random.random() < mutation_probability:
-                chd.mutate(mutation_percent)
-            population.append(chd)
-        # Evaluate each individual
-        eval_list = [indv for indv in population if indv.fitness is None]
-        eval_args = [(indv, evaluate_function, profile) for indv in eval_list]
-        with mp.Pool(num_processes) as procpool:
-            results = procpool.starmap(_genetic_algorithm_evaluate, eval_args)
-        # Deal with the results of the evaluations.
+    try:
+        for epoch in range(num_epochs):
+            population, generation = checkpoint(population, generation, filename)
+            print("CHECKPOINT %d, POP SZ %d, %s"%(generation, len(population), filename))
+            # Generate new parameters and new combinations of parameters.
+            for _ in range(population_size):
+                chd = parameter_class()
+                chd.crossover(random.sample(population, min(2, len(population))))
+                if random.random() < mutation_probability:
+                    chd.mutate(mutation_percent)
+                population.append(chd)
+            # Evaluate each individual
+            eval_list = [indv for indv in population if indv.fitness is None]
+            eval_args = [(indv, evaluate_function, profile) for indv in eval_list]
+            with mp.Pool(num_processes) as procpool:
+                results = procpool.starmap(_genetic_algorithm_evaluate, eval_args)
+            # Unpack with the results of the evaluations.
+            if profile:
+                fitness_list, profiles = zip(*results)
+                profile_stats.extend(profiles)
+            else:
+                fitness_list = results
+            for indv, fit_dict in zip(eval_list, fitness_list):
+                indv.apply_eval_return(fit_dict)
+            # Cull the population down to size.
+            population.sort(key=lambda indv: indv.fitness, reverse=True)
+            population = population[:population_size]
+            generation += 1
+            print("Mean fitness %g"%(sum(indv.fitness for indv in population)/len(population)))
+    finally:
         if profile:
-            fitness_list, profiles = zip(*results)
-            profile_stats.extend(profiles)
-        else:
-            fitness_list = results
-        for indv, fit_dict in zip(eval_list, fitness_list):
-            # Put the fitnesses where they belong.
-            for attr_name, fitness in fit_dict.items():
-                setattr(indv, attr_name, fitness)
-        # Cull the population down to size.
-        population.sort(key=lambda indv: indv.fitness, reverse=True)
-        population = population[:population_size]
-        generation += 1
-        print("Mean fitness %g"%(sum(indv.fitness for indv in population)/len(population)))
-
-    if profile:
-        # Assemble each evaluation's profile into one big profile and print it.
-        stats = pstats.Stats(*profile_stats)
-        stats.sort_stats('time')
-        stats.print_stats()
-        for tempfile in profile_stats:
-            os.remove(tempfile)     # Clean up
+            # Assemble each evaluation's profile into one big profile and print it.
+            stats = pstats.Stats(*profile_stats)
+            stats.sort_stats('time')
+            stats.print_stats()
+            for tempfile in profile_stats:
+                os.remove(tempfile)     # Clean up
 
     population, generation = checkpoint(population, generation, filename)
     print("SUMMARY FOR GENERATION %d, %s"%(generation, filename))
@@ -430,9 +461,6 @@ def _genetic_algorithm_evaluate(individual, evaluate_function, profile):
         pr.enable()
     try:
         fitness = evaluate_function(individual)
-        # Check that evaluate_function returned a valid result.
-        if fitness.keys() != individual.fitness_names_and_weights.keys():
-            raise TypeError("Evaluate function returned dictionary which has missing/extra keys.")
     except ValueError:
         print(str(individual))
         traceback.print_exc()

@@ -120,8 +120,10 @@ def synthesize(seed, diag=False):
     return synth
 
 
-class MNIST_Parameters(genetics.Parameters):
+class MNIST_Parameters(genetics.Individual):
     parameters = ['sp', 'sdrc',]
+    fitness_names_and_weights = {'score': 1,}
+    train_time = 1/2
     def __init__(self,):
         self.sp = SpatialPoolerParameters(
             column_dimensions   = (1.216e+02, 1.274e+02),
@@ -147,7 +149,7 @@ def evaluate(parameters):
     sdrc          = SDR_Classifier(parameters.sdrc, machine.column_dimensions, class_shape, 'index')
 
     # Training Loop
-    train_cycles = len(train_images) * 1/2
+    train_cycles = len(train_images) * parameters.train_time
     for i in range(int(round(train_cycles))):
         img, lbl      = random.choice(training_data)
         img           = synthesize(img, diag=False)
@@ -163,12 +165,12 @@ def evaluate(parameters):
         prediction  = np.argmax(sdrc.predict(state))
         if prediction == lbl:
             score   += 1
-    return score / len(test_data)
+    return {'score': score / len(test_data)}
 
 
 if False:
     # I'm keeping the following diagnostic code snippets just in case I ever
-    # need them.  They are old and may not work.
+    # need them.  They are outdated and may not work.
     from matplotlib import pyplot as plt
 
     if False:
@@ -234,27 +236,39 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-n', '--processes',  type=int, default=7, 
         help="Number of processes to use.")
+    parser.add_argument('-t', '--time',       type=float, default=1/2,
+        help='Number of times to run through the training data.')
     parser.add_argument('-p', '--population', type=int, default=50)
-    parser.add_argument('-e', '--epochs',    type=int, default=1)
-    parser.add_argument('--seed',        type=bool, default=False,
-        help='If True, start a new population and ignore any saved checkpoints, '+
-             'if False then loads the latest checkpoint from file.')
+    parser.add_argument('-e', '--epochs',     type=int, default=1)
+    parser.add_argument('--seed',             action='store_true',
+        help='Starts a new population and ignore any saved checkpoints, '+
+             'Otherwise this loads the latest checkpoint from file.')
     parser.add_argument('--checkpoint',  type=str,  default='checkpoint',
         help='What name to save the results by.')
+    parser.add_argument('--default_parameters',  action='store_true', 
+        help='Evaluate just the default parameters.')
     args = parser.parse_args()
 
-    genetics.genetic_algorithm(
-        MNIST_Parameters,
-        evaluate,
-        population_size                 = args.population,
-        num_epochs                      = args.epochs,
-        seed                            = args.seed,
-        seed_mutations_per_parameter    = 20,
-        seed_mutation_percent           = 0.05,
-        mutation_probability            = 0.20,
-        mutation_percent                = 0.10,
-        filename                        = args.checkpoint,
-        num_processes                   = args.processes,
-        profile                         = True,
-    )
-    exit(0)
+    MNIST_Parameters.train_time = args.time
+
+    if args.default_parameters:
+        default = MNIST_Parameters()
+        print(default)
+        print()
+        print('Evaluate returned', evaluate(default))
+    else:
+        genetics.genetic_algorithm(
+            MNIST_Parameters,
+            evaluate,
+            population_size                 = args.population,
+            num_epochs                      = args.epochs,
+            seed                            = args.seed,
+            seed_mutations_per_parameter    = 20,
+            seed_mutation_percent           = 0.05,
+            mutation_probability            = 0.20,
+            mutation_percent                = 0.10,
+            filename                        = args.checkpoint,
+            num_processes                   = args.processes,
+            profile                         = True,
+        )
+        exit(0)

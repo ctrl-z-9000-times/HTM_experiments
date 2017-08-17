@@ -14,7 +14,7 @@ import re
 import cv2
 import PIL, PIL.ImageDraw
 from genetics import Parameters
-
+import htm_cython
 
 def random_tag(length=2):
     return ''.join(chr(ord('A') + random.randrange(26)) for _ in range(length))
@@ -272,7 +272,7 @@ class ChannelThresholderParameters(Parameters):
         'stddev',
     ]
     def __init__(self,
-        channel = ChannelEncoderParameters(),
+        channel = None,
         mean    = .5,
         stddev  = .2,):
         """
@@ -280,7 +280,10 @@ class ChannelThresholderParameters(Parameters):
         Argument mean is the average activation threshold.
         Argument stddev is the standard deviation of activation thresholds.
         """
-        self.channel = channel
+        if channel is not None:
+            self.channel = channel
+        else:
+            self.channel = ChannelEncoderParameters()
         self.mean    = mean
         self.stddev  = stddev
 
@@ -352,10 +355,10 @@ class EyeSensorParameters(Parameters):
         fovea_param_2   = 20,
         min_scale       =  1,
         max_scale       = 10,
-        hue_encoder     = ChannelEncoderParameters(),
-        sat_encoder     = ChannelEncoderParameters(),
-        val_encoder     = ChannelEncoderParameters(),
-        edge_encoder    = ChannelThresholderParameters(),
+        hue_encoder     = None,
+        sat_encoder     = None,
+        val_encoder     = None,
+        edge_encoder    = None,
         # Control Vector Defaults
         # num_cv       = 600,
         # pos_stddev   = 10,
@@ -409,6 +412,14 @@ class EyeSensorParameters(Parameters):
         del kw_args['self']
         del kw_args['__class__']
         super().__init__(**kw_args)
+        if hue_encoder is None:
+            self.hue_encoder     = ChannelEncoderParameters()
+        if sat_encoder is None:
+            self.sat_encoder     = ChannelEncoderParameters()
+        if val_encoder is None:
+            self.val_encoder     = ChannelEncoderParameters()
+        if edge_encoder is None:
+            self.edge_encoder    = ChannelThresholderParameters()
 
 class EyeSensor:
     """
@@ -1432,11 +1443,19 @@ class SpatialPooler(SaveLoad):
         self.stability_sample_size = stability_sample_size
         self.stability_samples     = []
 
-        self.proximal = SynapseManager(self.input_dimensions, 
-                                        self.column_dimensions,
-                                        args.radii,
-                                        potential_pool=args.potential_pool,
-                                        diag=False)
+        if False:
+            self.proximal = SynapseManager(self.input_dimensions, 
+                                            self.column_dimensions,
+                                            args.radii,
+                                            potential_pool=args.potential_pool,
+                                            diag=False)
+        else:
+            self.proximal = htm_cython.SynapseManager_implicit_synapse(
+                                            self.input_dimensions, 
+                                            self.column_dimensions,
+                                            args.radii,
+                                            potential_pool=args.potential_pool,
+                                            diag=False)
         self.proximal.coincidence_inc    = args.coincidence_inc
         self.proximal.coincidence_dec    = args.coincidence_dec
         self.proximal.permanence_thresh  = args.permanence_thresh
@@ -1485,10 +1504,11 @@ class SpatialPooler(SaveLoad):
             inhibition_radii    = self.proximal.inhibition_radii
             raw_excitment       = raw_excitment.reshape(self.column_dimensions)
             avg_local_excitment = scipy.ndimage.filters.gaussian_filter(
-                                    raw_excitment, inhibition_radii, mode='reflect')
+                                    # Truncate for speed
+                                    raw_excitment, inhibition_radii, mode='reflect', truncate=3.0)
             local_excitment     = raw_excitment - avg_local_excitment
             stddev              = np.sqrt(scipy.ndimage.filters.gaussian_filter(
-                                    local_excitment**2, inhibition_radii, mode='reflect'))
+                                    local_excitment**2, inhibition_radii, mode='reflect', truncate=3.0))
             raw_excitment       = np.nan_to_num(local_excitment / stddev)
             self.zz_norm        = raw_excitment.reshape(self.column_dimensions)
             raw_excitment       = raw_excitment.flatten()
@@ -1857,6 +1877,17 @@ class SpatialPooler(SaveLoad):
         return '\n'.join(st)
 
 
+"""
+Outstanding Tasks for T.M.
+
+Nupic has a bunch of rules to determine which segment learns when a column bursts
+
+synapses_per_segment unimplemetned
+
+The TM is going to need continuously running metrics, much like the SP's metrics
+* instantaneous anomally, exponential average anomally
+* instantaneous input overlap? exponential average input overlap?
+"""
 class TemporalMemoryParameters(Parameters):
     parameters = [
         'cells_per_column',
