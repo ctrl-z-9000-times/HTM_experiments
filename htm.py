@@ -1,1399 +1,63 @@
 # Written by David McDougall, 2017
+"""
+BUILD COMMAND
+./setup.py build_ext --inplace
+"""
 
 import numpy as np
-import math
 import scipy.ndimage
-import scipy.spatial
-import scipy.stats
 import random
-import cv2
-import pickle
-import sys
-import os, os.path
-import re
-import cv2
-import PIL, PIL.ImageDraw
+import copy
 from genetics import Parameters
-import htm_cython
+from encoders import *
+from classifiers import *
+from sdr import SDR, SynapseManager
 
-def random_tag(length=2):
-    return ''.join(chr(ord('A') + random.randrange(26)) for _ in range(length))
-instance_tag = random_tag()
-
-
-class SaveLoad:
-    """
-    Saves/Loads pickled classes from file
-
-    Default folder is name of program + "_data/".  
-    Change this by setting SaveLoad.tag to the desired postfix.  
-    This tag may contain slashes, which of course indicate more directories.  
-
-    Subclasses must define the class attribute 'data_extension' to the 
-    default file name extension for the save files.
-    """
-    # TODO: Consider naming save files by their instance-tag instead of their age.  
-    tag = 'data'
-    def save(self, filename=None, extension=None):
-        if filename is None:
-            if extension is None:
-                extension = self.data_extension
-            program, ext  = os.path.splitext(sys.argv[0])
-            path, program = os.path.split(program)
-            folder        = os.path.join(path, program + '_' + SaveLoad.tag)
-            filename      = program + '.' + str(self.age) + '.' + extension.lstrip('.')
-            filename      = os.path.join(folder, filename)
-        print("Saving", filename)
-        try:
-            os.makedirs(folder)
-        except OSError:
-            pass
-        pickle.dump(self, open(filename, 'wb'))
-
-    @classmethod
-    def load(cls, filename=None, extension=None):
-        if filename is None:
-            if extension is None:
-                extension = cls.data_extension
-            program, ext  = os.path.splitext(sys.argv[0])
-            path, program = os.path.split(program)
-            folder        = os.path.join(path, program + '_' + SaveLoad.tag)
-            matches       = []
-            for fn in os.listdir(folder):
-                fn_format = program + r'\.(\d+)\.' + extension.lstrip('.') + '$'
-                m = re.match(fn_format, fn)
-                if m:
-                    age = int(m.groups()[0])
-                    matches.append((fn, age))
-            matches.sort(key=lambda p: p[1])    # Sort by age
-            if not matches:
-                raise FileNotFoundError("No file in directory %s/ matching r'%s'"%(folder, fn_format))
-            filename = matches[-1][0]
-            filename = os.path.join(folder, filename)
-        self = pickle.load(open(filename, 'rb'))
-        print("Loaded %s   age %d"%(filename, self.age))
-        return self
-
-
-# TODO: This should use or at least print the radius, ie the distance at which
-# two numbers will have 50% overlap.  Radius is a replacement for resolution.
-class RandomDistributedScalarEncoderParameters(Parameters):
-    parameters = [
-        "resolution",
-        "size",
-        "sparsity",     # TODO: Replace this with 'on_bits'
-    ]
-    def __init__(self, resolution = 1, size = 128, sparsity = .15):
-        self.resolution   = resolution
-        self.size         = size
-        self.sparsity     = sparsity
-
-class RandomDistributedScalarEncoder:
-    """https://arxiv.org/pdf/1602.05925.pdf"""
-    def __init__(self, parameters):
-        self.args = args    = parameters
-        self.size           = int(round(args.size))
-        self.on_bits        = int(round(args.size * args.sparsity))
-        self.output_shape   = (int(round(self.size)),)
-
-    def encode(self, value):
-        # This must be integer division! Everything under the resolution must be removed.
-        index = value // self.args.resolution
-        code = np.zeros(self.output_shape, dtype=np.bool)
-        for offset in range(self.on_bits):
-            # Cast to string before hash, python3 will not hash an integer, uses
-            # value instead.
-            h = hash(str(index + offset))
-            bucket = h % self.size
-            # If this bucket is already full, walk around until it finds one
-            # that isn't taken.
-            while code[bucket]:
-                bucket = (bucket + 1) % self.size
-            code[bucket] = True
-        return code
-
-
-class EnumEncoder:
-    # TEST ME AND USE ME OR REMOVE ME
-    """
-    Encodes arbirary enumerated values.
-    There is no semantic similarity between encoded values.
-    """
-    def __init__(self, bits, sparsity, diag=True):
-        self.bits         = bits
-        self.sparsity     = sparsity
-        self.on_bits      = int(round(self.bits * self.sparsity))
-        self.enums        = set()
-        self.output_shape = (self.bits,)
-        if diag:
-            print("Enum Encoder: %d bits %.2g%% sparsity"%(bits, 100*sparsity))
-
-    def add_enum(self, names):
-        """Accepts either a string or a list of strings."""
-        if isinstance(names, str):
-            self.enums.add(names)
-        else:
-            self.enums.update(names)
-
-    def encode(self, names):
-        """
-        Accepts either a string of a list of strings.
-        All enum names must have been added via ee.add_enum(...)
-
-        Returns dense boolean array, union of the given names
-        """
-        if isinstance(names, str):
-            names = [names]
-        bits = np.zeros((self.bits,), dtype=np.bool)
-        bits_per_enum = int(round(self.bits * self.sparsity / len(names)))
-        total_bits = len(names) * bits_per_enum
-        for nm in names:
-            assert(nm in self.enums)
-            r = random.Random(hash(nm))
-            b = r.sample(range(self.bits), total_bits)
-            b = random.sample(b, bits_per_enum)
-            bits[b] = True
-        return bits
-
-
-class BWImageEncoder:
-    def __init__(self, input_space, diag=True):
-        input_space = tuple(input_space)
-        self.output_shape = input_space + (2,)
-        if diag:
-            print("Image Encoder")
-            print("\tInput -> Output shapes are", input_space, '->', self.output_shape)
-
-    def encode(self, image):
-        mean = np.mean(image)
-        on_bits  = image >= mean
-        off_bits = np.logical_not(on_bits)
-        return np.dstack([on_bits, off_bits])
-
-
-class ChannelEncoderParameters(Parameters):
-    parameters = [
-        'num_samples',
-        'sparsity',
-    ]
-    def __init__(self, num_samples = 5, sparsity = .20,):
-        """
-        Argument num_samples is number of bits in the output SDR which will
-                 represent each input number, this is the added data depth.
-        Argument sparsity is fraction of output which on average will be active.
-                 This is also the fraction of the input spaces which (on 
-                 average) each range covers.
-        """
-        self.num_samples  = num_samples
-        self.sparsity     = sparsity
-
-# TODO: Measure the output sparsity
-class ChannelEncoder:
-    """
-    This assigns a random range to each bit of the output SDR.  Each bit becomes
-    active if its corresponding input falls in its range.  By using random
-    ranges, each bit represents a different thing even if it mostly overlaps
-    with other comparable bits.  This way redundant bits add meaning.
-    """
-    def __init__(self, parameters, input_shape,
-        dtype       = np.float64,
-        drange      = range(0,1),
-        wrap        = False):
-        """
-        Argument parameters is an instance of ChannelEncoderParameters.
-        Argument input_shape is tuple of dimensions of each input frame.
-        Argument dtype is numpy data type of channel.
-        Argument drange is a range object or a pair of values representing the 
-                 range of possible channel values.
-        Argument wrap ... default is False.
-                 This supports modular input spaces and ranges which wrap
-                 around. It does this by rotating the inputs by a constant
-                 random amount which hides where the discontinuity in ranges is.
-                 No ranges actually wrap around the input space.
-        """
-        assert(isinstance(parameters, ChannelEncoderParameters))
-        self.args = args  = parameters
-        self.input_shape  = tuple(input_shape)
-        self.output_shape = self.input_shape + (int(round(args.num_samples)),)
-        self.dtype        = dtype
-        self.drange       = drange
-        self.len_drange   = max(drange) - min(drange)
-        self.wrap         = bool(wrap)
-        if self.wrap:
-            self.offsets  = np.random.uniform(0, self.len_drange, self.input_shape)
-            self.offsets  = np.array(self.offsets, dtype=self.dtype)
-        # Mean and std-dev of sizes of ranges which bits respond to.
-        self.mean_size    = self.len_drange * args.sparsity
-        self.std_size     = self.mean_size / 8
-        # Make the centers and sizes of each range.
-        if self.wrap:
-            # If wrapping is enabled then don't generate ranges which are very
-            # likely to get truncated near the edges.
-            centers = np.random.uniform(min(self.drange) + self.std_size,
-                                        max(self.drange) - self.std_size,
-                                        size=self.output_shape)
-        else:
-            centers = np.random.uniform(min(self.drange),
-                                        max(self.drange),
-                                        size=self.output_shape)
-        sizes = np.random.normal(self.mean_size, self.std_size, self.output_shape) / 2
-        # Make the lower and upper bounds of the ranges.
-        self.low  = np.array(centers - sizes, dtype=self.dtype)
-        self.high = np.array(centers + sizes, dtype=self.dtype)
-
-    def encode(self, img):
-        assert(img.shape == self.input_shape)
-        assert(img.dtype == self.dtype)
-        if self.wrap:
-            img += self.offsets
-            # Technically this should subtract min(drange) before doing modulus
-            # but the results should also be indistinguishable B/C of the random
-            # offsets.  Min(drange) effectively becomes part of the offset.
-            img %= self.len_drange
-            img += min(self.drange)
-        img = img.reshape(img.shape + (1,))
-        return np.logical_and(self.low <= img, img <= self.high)
-
-    def __str__(self):
-        lines = ["Channel Encoder,  num-samples %d"%int(round(self.args.num_samples))]
-        lines.append("\tSparsity %.03g, Deviation %.03g, %s %s %s"%(
-                self.args.sparsity,
-                self.std_size,
-                self.dtype.__name__,
-                self.drange,
-                'Wrapped' if self.wrap else ''))
-        return '\n'.join(lines)
-
-
-class ChannelThresholderParameters(Parameters):
-    parameters = [
-        'channel',
-        'mean',
-        'stddev',
-    ]
-    def __init__(self,
-        channel = None,
-        mean    = .5,
-        stddev  = .2,):
-        """
-        Argument channel is an instance of ChannelEncoderParameters
-        Argument mean is the average activation threshold.
-        Argument stddev is the standard deviation of activation thresholds.
-        """
-        if channel is not None:
-            self.channel = channel
-        else:
-            self.channel = ChannelEncoderParameters()
-        self.mean    = mean
-        self.stddev  = stddev
-
-# TODO: Measure the output sparsity
-class ChannelThresholder:
-    """
-    Assigns each bit of the given channel encoder with an additional activation
-    threshold.  A bit becomes active iff the underlying channel encoder
-    activates it and its magnitude is not less than its threshold.  Activation
-    thresholds are normally distributed.
-
-    This class wraps a channel encoder.
-    """
-    def __init__(self, parameters, input_shape,  dtype, drange, wrap):
-        """
-        Argument parameters is an instance of ChannelThresholderParameters.
-        Argument input_shape is tuple of dimensions of each input frame.
-        Arguments dtype, drange, and wrap are passed through to the underlying
-                  channel encoder.
-        """
-        assert(isinstance(parameters, ChannelThresholderParameters))
-        self.args = args = parameters
-        self.channel     = ChannelEncoder(args.channel, input_shape, 
-                            dtype=dtype, drange=drange, wrap=wrap)
-        self.thresholds  = np.random.normal(args.mean, args.stddev, self.channel.input_shape)
-        self.thresholds  = np.array(self.thresholds, dtype)
-        self.output_shape = self.channel.output_shape
-
-    def encode(self, img_data, magnitude):
-        """
-        Send raw data and magnitudes, this runs the channel encoder as well as
-        the thresholder.
-        """
-        sdr = self.channel.encode(img_data)
-        assert(magnitude.shape == self.channel.input_shape)
-        sdr[magnitude < self.thresholds] = False
-        return sdr
-
-
-class EyeSensorParameters(Parameters):
-    parameters = [
-        # Retina Parameters
-        'eye_dimensions',
-        'fovea_param_1',
-        'fovea_param_2',
-        'min_scale',
-        'max_scale',
-        'hue_encoder',
-        'sat_encoder',
-        'val_encoder',
-        'edge_encoder',
-        # Control Vector Parameters
-        # 'num_cv',
-        # 'pos_stddev',
-        # 'angle_stddev',
-        # 'scale_stddev',
-        # Motor Sensor Parameters
-        # 'position_encoder',
-        # 'velocity_encoder',
-        # 'angle_encoder',
-        # 'angular_velocity_encoder',
-        # 'scale_encoder',
-        # 'scale_velocity_encoder',
-    ]
-    def __init__(self,
-        # Retina Defaults
-        eye_dimensions  = (512, 512),
-        fovea_param_1   = .05,
-        fovea_param_2   = 20,
-        min_scale       =  1,
-        max_scale       = 10,
-        hue_encoder     = None,
-        sat_encoder     = None,
-        val_encoder     = None,
-        edge_encoder    = None,
-        # Control Vector Defaults
-        # num_cv       = 600,
-        # pos_stddev   = 10,
-        # angle_stddev = math.pi / 8,
-        # scale_stddev = 2,
-        # Motor Sensor Defaults
-        # position_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = 1,),
-        # velocity_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = 1,),
-        # angle_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = math.pi / 80,),
-        # angular_velocity_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = math.pi / 80,),
-        # scale_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = .2,),
-        # scale_velocity_encoder = RandomDistributedScalarEncoderParameters(
-        #                         size        = 100,
-        #                         sparsity    = 0.20,
-        #                         resolution  = .2, ),
-        ):
-        """
-        Argument eye_dimensions ...
-        Arguments fovea_param_1 and fovea_param_2 ...
-        Arguments min_scale and max_scale ...
-        Arguments hue_encoder, sat_encoder and val_encoder are instances of
-                  ChannelEncoderParameters.
-        Argument edge_encoder is an instance of ChannelThresholderParameters.
-
-        Argument num_cv is the approximate number of control vectors to use.
-        Arguments pos_stddev, angle_stddev, and scale_stddev are the standard
-                  deviations of the control vector movements, they are normally
-                  distributed about a mean of 0.
-
-        Arguments position_encoder, velocity_encoder, angle_encoder, angular_velocity_encoder,
-                  scale_encoder, and scale_velocity_encoder are instances of 
-                  RandomDistributedScalarEncoderParameters.
-        """
-        # Get the parent class to save all these parameters.
-        kw_args = locals().copy()
-        del kw_args['self']
-        del kw_args['__class__']
-        super().__init__(**kw_args)
-        if hue_encoder is None:
-            self.hue_encoder     = ChannelEncoderParameters()
-        if sat_encoder is None:
-            self.sat_encoder     = ChannelEncoderParameters()
-        if val_encoder is None:
-            self.val_encoder     = ChannelEncoderParameters()
-        if edge_encoder is None:
-            self.edge_encoder    = ChannelThresholderParameters()
-
-class EyeSensor:
-    """
-    Eye sensor with controllable movement and central fovae.
-
-    This eye sensor was designed with the following criteria:
-    1) The central fovae should be capable of identifying objects in 1 or 2 saccades.
-    2) The periferal vision should be capable of locating and tracking objects.
-
-    This eye has 4 degrees of freedom: X and Y location, scale, and orientation.
-    These values can be controlled by activating control vectors, each of which 
-    has a small but cumulative effect.  CV's are normally distributed with a
-    mean of zero.  
-
-    The eye outputs the its current location, scale and orientation as well as 
-    their first derivatives w/r/t time as a dense SDR.
-
-    Fun Fact: The human optic nerve has 800,000 ~ 1,700,000 nerve fibers.
-    """
-    def __init__(self, parameters):
-        """
-        Attributes:
-            The following are the shapes of SDR's used by this class
-                self.view_shape         retina's output
-                self.control_shape      eye movement input controls
-                self.motor_shape        internal motor sensor output
-
-            self.rgb            The most recent view, kept as a attribute for
-                                making diagnostics.
-
-            self.motor_sdr      The SDR encoded output of the internal motor 
-                                sensors, kept as a attribute for convenience.
-
-            self.position       (X, Y) coords of eye within image, Read/Writable
-            self.orientation    ... Read/Writable
-            self.scale          ... Read/Writable
-
-            self.gaze   List of tuples of (X, Y, Orientation, Scale)
-                        History of recent movements, self.move() updates this.
-                        This is cleared by the following methods:
-                            self.reset()
-                            self.new_image()
-                            self.center_view()
-                            self.randomize_view()
-
-        Private Attributes:
-            self.eye_coords.shape = (2, view-x, view-y)
-            self.eye_coords[input-dim, output-coordinate] = input-coordinate
-        """
-        self.args = args = parameters
-        self.eye_dimensions = tuple(int(round(ed)) for ed in args.eye_dimensions)
-        self.eye_coords = EyeSensor.complex_eye_coords(self.eye_dimensions,
-                                        args.fovea_param_1, args.fovea_param_2)
-        self.hue_encoder = ChannelEncoder(  args.hue_encoder,
-                                            input_shape = self.eye_dimensions,
-                                            dtype       = np.float32,
-                                            drange      = range(0,360),
-                                            wrap        = True,)
-        self.sat_encoder = ChannelEncoder(  args.sat_encoder,
-                                            input_shape = self.eye_dimensions,
-                                            dtype  = np.float32,
-                                            drange = (0, 1),
-                                            wrap   = False,)
-        self.val_encoder = ChannelEncoder(  args.val_encoder,
-                                            input_shape = self.eye_dimensions,
-                                            dtype  = np.float32,
-                                            drange = (0, 1),
-                                            wrap   = False,)
-        self.edge_encoder = ChannelThresholder(args.edge_encoder,
-                                            input_shape = self.eye_dimensions,
-                                            dtype  = np.float32,
-                                            drange = (-math.pi, math.pi),
-                                            wrap   = True)
-
-        depth = sum((self.hue_encoder.output_shape[2],
-                     self.sat_encoder.output_shape[2],
-                     self.val_encoder.output_shape[2],
-                     self.edge_encoder.output_shape[2],))
-        self.view_shape = self.eye_dimensions + (depth,)
-
-        # self.control_vectors, self.control_shape = self.make_control_vectors(
-        #         num_cv       = args.num_cv,
-        #         pos_stddev   = args.pos_stddev,
-        #         angle_stddev = args.angle_stddev,
-        #         scale_stddev = args.scale_stddev,
-        #         verbosity    = verbosity,)
-
-        # size    = 128
-        # on_bits = .10 * size
-        # self.motor_encoders, self.motor_shape = self.make_motor_encoders(size, on_bits)
-
-        self.reset()
-        # if verbosity:
-            # self.print_parameters()
-
-    @staticmethod
-    def simple_eye_coords(eye_dims):
-        """
-        Returns sampling coordinates for a uniform density eye.
-        Argument eye_dims is shape of eye receptors, output shape
-        """
-        return np.mgrid[[slice(-d//2, d//2) for d in eye_dims]]
-
-    @staticmethod
-    def complex_eye_coords(eye_dims, fovea_param_1, fovea_param_2, verbosity=0):
-        """
-        Returns sampling coordinates for a non-uniform density eye.
-            retval[output-coord] = sample-offset
-
-        Argument eye_dims is shape of eye receptors, output shape
-        Arguments fovea_param_1 and fovea_param_2 are magic constants, try 0.05
-                  and 20, respctively.
-        """
-        def gauss(x, mean, stddev):
-            return np.exp(-(x - mean) ** 2 / (2 * stddev ** 2))
-
-        # Flat eye is index array of the output locations
-        flat_eye    = EyeSensor.simple_eye_coords(eye_dims)
-        flat_eye    = np.array(flat_eye, dtype=np.float64)    # Cast to float
-        # Jitter each coordinate, but not enough to make them cross.
-        # The purpose of this jitter is to break up any aliasing patterns.
-        flat_eye    += np.random.normal(0, .33, flat_eye.shape)
-        # Radial distances from center to output locations.
-        radius      = np.hypot(flat_eye[0], flat_eye[1])
-        max_radius  = int(np.ceil(np.max(radius))) + 1
-
-        #
-        # Density function
-        # This controls the shape of the eye.
-        #
-        density = [fovea_param_1 + gauss(x, 0, max_radius/fovea_param_2) for x in range(max_radius)]
-
-        # Force Density[radius == 0] == 0.
-        # This is needed for interpolation to work.
-        density = [0] + density
-
-        # Integrate density over radius and as a function of radius.
-        # Units are receptors per unit radial distance
-        retina_area = np.cumsum(density)
-        # Normalize density's integral to 1, this is needed for jitter.
-        density = np.divide(density, retina_area[-1])
-        # Normalize number of receptors to range [0, max-radius]
-        retina_area *= max_radius / retina_area[-1]
-        # Invert, units are now units radial distance per receptor.
-        inverse = scipy.interpolate.interp1d(retina_area, np.arange(max_radius + 1))
-        receptor_radius = inverse(np.arange(max_radius))
-
-        # receptor_radius is mapping from output-space radius to input-space
-        # radius.  Apply it to the flat coordinates to find eye coordinates.
-        radius_idx = np.array(np.rint(radius), dtype=np.int) # Integer cast radius for use as index.
-        flat_eye[:, ...] *= np.nan_to_num(receptor_radius[radius_idx] / radius)
-
-        if verbosity >= 2:
-            plt.figure("Complex Eye Diagnostics")
-            plt.subplot(1, 2, 1)
-            plt.plot(density)
-            plt.title("Density")
-            plt.ylabel("Fraction of receptors")
-            plt.xlabel("Distance from center")
-            plt.subplot(1, 2, 2)
-            plt.plot(receptor_radius)
-            plt.title("Receptor Mapping")
-            plt.ylabel("Input Radius")
-            plt.xlabel("Output radius")
-            plt.show()
-        return flat_eye
-
-    @staticmethod
-    def make_control_vectors(num_cv, pos_stddev, angle_stddev, scale_stddev, verbosity=0):
-        """
-        Argument num_cv is the approximate number of control vectors to create
-        Arguments pos_stddev, angle_stddev, and scale_stddev are the standard
-                  deviations of the controls effects of position, angle, and 
-                  scale.
-
-        Returns pair of control_vectors, control_shape
-
-        The control_vectors determines what happens for each output. Each
-        control is a 4-tuple of (X, Y, Angle, Scale) movements. To move,
-        active controls are summed and applied to the current location.
-        """
-        cv_sz = int(round(num_cv // 6))
-        control_shape = (6*cv_sz,)
-
-        pos_controls = [
-            (random.gauss(0, pos_stddev), random.gauss(0, pos_stddev), 0, 0)
-                for i in range(4*cv_sz)]
-
-        angle_controls = [
-            (0, 0, random.gauss(0, angle_stddev), 0)
-                for angle_control in range(cv_sz)]
-
-        scale_controls = [
-            (0, 0, 0, random.gauss(0, scale_stddev))
-                for scale_control in range(cv_sz)]
-
-        control_vectors = pos_controls + angle_controls + scale_controls
-        random.shuffle(control_vectors)
-        control_vectors = np.array(control_vectors)
-
-        # Add a little noise to all control vectors
-        control_vectors[:, 0] += np.random.normal(0, pos_stddev/10,    control_shape)
-        control_vectors[:, 1] += np.random.normal(0, pos_stddev/10,    control_shape)
-        control_vectors[:, 2] += np.random.normal(0, angle_stddev/10,  control_shape)
-        control_vectors[:, 3] += np.random.normal(0, scale_stddev/10,  control_shape)
-        if verbosity >= 2:
-            print("Control Vectors")
-            print(control_vectors)
-        return control_vectors, control_shape
-
-    def make_motor_encoders(self, size, on_bits):
-        """
-        Create the Motor Sensor Encoders
-        This creates eight (8) encoders, all with the same size and on-bits.
-
-        Argument size
-        Argument on_bits
-
-        Returns encoders, shape
-            Where encoders is a list of RDSE's
-              and shape is the resulting motor sensor SDR shape
-        """
-        dp      = self.pos_stddev / 10
-        ds      = self.scale_stddev / 10
-        da      = self.angle_stddev / 10
-        motor_encoders = [                  # (Res, Size, OnBits)
-            htm.RandomDistributedScalarEncoder(dp, size, on_bits),    # x position
-            htm.RandomDistributedScalarEncoder(dp, size, on_bits),    # y position
-            htm.RandomDistributedScalarEncoder(da, size, on_bits),    # orientation
-            htm.RandomDistributedScalarEncoder(ds, size, on_bits),    # scale
-
-            htm.RandomDistributedScalarEncoder(dp, size, on_bits),    # x velocity
-            htm.RandomDistributedScalarEncoder(dp, size, on_bits),    # y velocity
-            htm.RandomDistributedScalarEncoder(da, size, on_bits),    # angular velocity
-            htm.RandomDistributedScalarEncoder(ds, size, on_bits),    # scale velocity
-        ]
-        motor_shape = (sum(enc.output_shape[0] for enc in motor_encoders),)
-        return motor_encoders, motor_shape
-
-    def reset(self):
-        self.position    = (0,0)
-        self.orientation = 0
-        self.scale       = 0
-        # self.motor_sdr   = np.zeros(self.motor_shape, dtype=np.bool)
-        self.image       = None
-        self.gaze        = []
-        self.edges       = None
-
-    def randomize_view(self):
-        """Set the eye's view point to a random location"""
-        self.orientation = random.random() * 2 * math.pi
-        self.scale       = random.uniform(self.args.min_scale, self.args.max_scale)
-        eye_radius       = np.multiply(self.scale / 2, self.eye_dimensions)
-        self.position    = [np.random.uniform(0, dim) for dim in self.image.shape[:2]]
-        # Discard any prior gaze tracking after forcibly moving eye position to new starting position.
-        self.gaze = [tuple(self.position) + (self.orientation, self.scale)]
-
-    def center_view(self):
-        """Center the view over the image"""
-        self.orientation = 0
-        self.position = np.divide(self.image.shape[:2], 2)
-        self.scale = np.max(np.divide(self.image.shape[:2], self.eye_dimensions))
-        # Discard any prior gaze tracking after forcibly moving eye position to new starting position.
-        self.gaze = [tuple(self.position) + (self.orientation, self.scale)]
-
-    def new_image(self, image, diag=False):
-        if isinstance(image, str):
-            self.image_file = image
-            self.image = np.array(PIL.Image.open(image))
-        else:
-            self.image_file = None
-            self.image = image
-        # Get the image into the right format.
-        if self.image.dtype != np.uint8:
-            raise TypeError('Image %s dtype is not unsigned 8 bit integer, image.dtype is %s.'%(
-                    '"%s"'%self.image_file if self.image_file is not None else 'argument',
-                    self.image.dtype))
-        self.image = np.squeeze(self.image)
-        if len(self.image.shape) == 2:
-            self.image = np.dstack([self.image] * 3)
-
-        self.preprocess_edges()
-        self.randomize_view()
-
-        if diag:
-            plt.figure('Image')
-            plt.title('Image')
-            plt.imshow(self.image, interpolation='nearest')
-            plt.show()
-
-    def preprocess_edges(self):
-        # Calculate the sobel edge features
-        grey    = np.sum(self.image/255., axis=2, keepdims=False, dtype=np.float64)/3.
-        sobel_x = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=7)
-        sobel_y = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=7)
-        self.edge_angles    = np.arctan2(sobel_y, sobel_x)
-        self.edge_angles    = np.array(self.edge_angles, dtype=np.float32)
-        self.edge_magnitues = (sobel_x ** 2 + sobel_y ** 2) ** .5
-        self.edge_magnitues = np.array(self.edge_magnitues, dtype=np.float32)
-
-    def move(self, control_index):
-        """
-        Apply the given control vector to the current gaze location
-        Also calculates the real velocity in each direction
-
-        Argument control_index is an index array of ON-bits in the control space.
-
-        Returns and SDR encoded representation of the eyes velocity.
-        """
-        # Calculate the forces on the motor
-        controls = self.control_vectors[control_index]
-        controls = np.sum(controls, axis=0)
-        dx, dy, dangle, dscale = controls
-        # Calculate rotation effects
-        self.orientation = (self.orientation + dangle) % (2*math.pi)
-        # Calculate scale effects
-        new_scale  = np.clip(self.scale + dscale, self.min_scale, self.max_scale)
-        real_ds    = new_scale - self.scale
-        avg_scale  = (new_scale + self.scale) / 2
-        self.scale = new_scale
-        # Calculate position effectsdy
-        # EXPERMENTIAL: Scale the movement such that the same CV yields the same
-        # visual displacement, regardless of scale.
-        x, y     = self.position
-        dx       *= avg_scale   
-        dy       *= avg_scale   
-        p        = [x + dx, y + dy]
-        p        = np.clip(p, [0,0], self.image.shape[:2])
-        real_dp  = np.subtract(p, self.position)
-        self.position = p
-        # Put together information about the motor
-        velocity = (
-            self.position[0],
-            self.position[1],
-            self.orientation,
-            self.scale,
-            real_dp[0],
-            real_dp[1],
-            dangle,
-            real_ds,
-        )
-        self.gaze.append(tuple(self.position) + (self.orientation, self.scale))
-        # Encode the motors sensory states and concatenate them into one big SDR.
-        v_enc = [enc.encode(v) for v, enc in zip(velocity, self.motor_encoders)]
-        self.motor_sdr = np.concatenate(v_enc)
-        # Shuffle the SDR with a psuedo random permutation seeded with the number 42
-        pass
-        return self.motor_sdr
-
-    def view(self):
-        """
-        Returns the image which the eye is currently seeing.
-
-        Attribute self.rgb is set to the current image which the eye is seeing.
-        """
-        # Rotate the samples points
-        c   = math.cos(self.orientation)
-        s   = math.sin(self.orientation)
-        rot = np.array([[c, -s], [s, c]])
-        global_coords = self.eye_coords.reshape(self.eye_coords.shape[0], -1)
-        global_coords = np.matmul(rot, global_coords)
-        # Scale/zoom the sample points
-        global_coords *= self.scale
-        # Position the sample points
-        global_coords += np.array(self.position).reshape(2, 1)
-        global_coords = tuple(global_coords)
-
-        # Extract the view from the larger image
-        channels = []
-        for c_idx in range(3):
-            ch = scipy.ndimage.map_coordinates(self.image[:,:,c_idx], global_coords,
-                                            mode='constant',    # No-wrap, fill
-                                            cval=255,           # Fill value
-                                            order=3)
-            channels.append(ch.reshape(self.eye_dimensions))
-        self.rgb = rgb = np.dstack(channels)
-
-        # Convert view to HSV and encode HSV to SDR.
-        hsv         = np.array(rgb, dtype=np.float32)
-        hsv         /= 255.
-        hsv         = cv2.cvtColor(hsv, cv2.COLOR_RGB2HSV)
-        hue_sdr     = self.hue_encoder.encode(hsv[..., 0])
-        sat_sdr     = self.sat_encoder.encode(hsv[..., 1])
-        val_sdr     = self.val_encoder.encode(hsv[..., 2])
-
-        # Extract edge samples
-        angles = scipy.ndimage.map_coordinates(self.edge_angles, global_coords,
-                                        mode='constant',    # No-wrap, fill
-                                        cval=0,             # Fill value
-                                        order=0)            # Take nearest value, no interp.
-        mags = scipy.ndimage.map_coordinates(self.edge_magnitues, global_coords,
-                                        mode='constant',    # No-wrap, fill
-                                        cval=0,             # Fill value
-                                        order=3)
-        angles   = angles.reshape(self.eye_dimensions)
-        mags     = mags.reshape(self.eye_dimensions)
-        edge_sdr = self.edge_encoder.encode(angles, mags)
-
-        return np.dstack([hue_sdr, sat_sdr, val_sdr, edge_sdr])
-
-    def input_space_sample_points(self, samples_size=100):
-        """
-        Returns a list of pairs of (x,y) coordinates into the input image which
-        correspond to a uniform sampling of the receptors given the eyes current
-        location.
-
-        The goal with this method is to determine what the eye is currently
-        looking at, given labeled training data.  There can be multiple labels
-        in the eyes receptive field (read: input space) at once.  Also the
-        labels are not perfectly accurate as they were hand drawn.  Taking a
-        large sample of points is a good approximation for sampling all points
-        in the input space, which would be the perfectly accurate solution (but
-        would be slow and perfection is not useful).
-        """
-        # Rotate the samples points
-        c   = math.cos(self.orientation)
-        s   = math.sin(self.orientation)
-        rot = np.array([[c, -s], [s, c]])
-        global_coords = self.eye_coords.reshape(self.eye_coords.shape[0], -1)
-        global_coords = np.matmul(rot, global_coords)
-
-        # Scale/zoom the sample points
-        global_coords *= self.scale
-
-        # Position the sample points
-        global_coords += np.array(self.position).reshape(2, 1)
-        sample_index  = random.sample(range(global_coords.shape[1]), samples_size)
-        samples       = global_coords[:, sample_index]
-        return np.array(np.rint(np.transpose(samples)), dtype=np.int32)
-
-    def gaze_tracking(self, diag=True):
-        """
-        Returns vector of tuples of (position-x, position-y, orientation, scale)
-        """
-        if diag:
-            im   = PIL.Image.fromarray(self.image)
-            draw = PIL.ImageDraw.Draw(im)
-            width, height = im.size
-            # Draw a red line through the centers of each gaze point
-            for p1, p2 in zip(self.gaze, self.gaze[1:]):
-                x1, y1, a1, s1 = p1
-                x2, y2, a2, s2 = p2
-                assert(x1 in range(0, width))
-                assert(x2 in range(0, width))
-                assert(y1 in range(0, height))
-                assert(y2 in range(0, height))
-                draw.line((x1, y1, x2, y2), fill='black', width=7)
-                draw.line((x1, y1, x2, y2), fill='red', width=2)
-            # Draw the bounding box of the eye sensor around each gaze point
-            for x, y, orientation, scale in self.gaze:
-                # Find the four corners of the eye's window
-                corners = []
-                for ec_x, ec_y in [(0,0), (0,-1), (-1,-1), (-1,0)]:
-                    corners.append(self.eye_coords[:, ec_x, ec_y])
-                # Rotate the corners
-                c = math.cos(orientation)
-                s = math.sin(orientation)
-                rot = np.array([[c, -s], [s, c]])
-                corners = np.transpose(corners)     # Convert from list of pairs to index array.
-                corners = np.matmul(rot, corners)
-                # Scale/zoom the sample points
-                corners *= scale
-                # Position the sample points
-                corners += np.array([x, y]).reshape(2, 1)
-                # Convert from index array to list of coordinates pairs
-                corners = list(tuple(coord) for coord in np.transpose(corners))
-                # Draw the points
-                for start, end in zip(corners, corners[1:] + [corners[0]]):
-                    assert(start[0] in range(0, width))
-                    assert(start[1] in range(0, height))
-                    assert(end[0]   in range(0, width))
-                    assert(end[1]   in range(0, height))
-                    draw.line(start+end, fill='green', width=2)
-            del draw
-            plt.figure("Gaze Tracking")
-            im = np.array(im)
-            plt.imshow(im, interpolation='nearest')
-            plt.show()
-        return self.gaze[:]
-
-    def print_parameters(self):
-        print("Eye Parameters")
-        print("\tRetina Input -> Output Shapes %s -> %s"%(str(self.eye_dimensions), str(self.view_shape)))
-        print("\tMotor Sensors %d, Motor Controls %d"%(self.motor_shape[0], self.control_shape[0]))
-
-class EyeSensorSampler:
-    """
-    Samples eyesensor.rgb, the eye's view.
-
-    Attribute samples is list of RGB numpy arrays.
-    """
-    def __init__(self, eyesensor, sample_period, number_of_samples=30):
-        """
-        This draws its samples directly from the output of eyesensor.view() by
-        wrapping the method.
-        """
-        self.sensor      = sensor = eyesensor
-        self.sensor_view = sensor.view
-        self.sensor.view = self.view
-        self.age         = 0
-        self.samples     = []
-        self.schedule    = random.sample(range(sample_period), number_of_samples)
-        self.schedule.sort(reverse=True)
-    def view(self, *args, **kw_args):
-        """Wrapper around eyesensor.view which takes samples"""
-        retval = self.sensor_view(*args, **kw_args)
-        if self.schedule and self.age == self.schedule[-1]:
-            self.schedule.pop()
-            self.samples.append(np.array(self.sensor.rgb))
-        self.age += 1
-        return retval
-    def view_samples(self):
-        if not self.samples:
-            return  # Nothing to show...
-        plt.figure("Sample views")
-        num = len(self.samples)
-        rows = math.floor(num ** .5)
-        cols = math.ceil(num / rows)
-        for idx, img in enumerate(self.samples):
-            plt.subplot(rows, cols, idx)
-            plt.imshow(img, interpolation='nearest')
-        plt.show()
-
-
-class SynapseManager:
-    """For pyramidal neuron synapses."""
-    def __init__(self, input_dimensions, output_dimensions,
-        radii=None,
-        potential_pool=.95,
-        coincidence_inc = 0.1,          # Do not touch.
-        coincidence_dec = 0.02,         # Do not touch.
-        permanence_threshold = 0.5,     # Do not touch.
-        diag=True):
-        """
-        Argument input_dimensions is tuple of input space dimensions
-        Argument output_dimensions is tuple of output space dimensions
-        Argument radii is tuple of convolutional radii, must be same length as output_dimensions
-                 radii units are the input space units
-                 radii is optional, if not given assumes no topology
-        Argument potential_pool is the fraction of possible inputs to include in 
-                 each columns potential pool of input sources.  Default is .95
-
-        Arguments coincidence_inc, coincidence_dec, permanence_threshold
-                In theory, permanence updates are the amount of time it takes to
-                learn  a thing, with units of number of gazes.
-
-        If output_dimensions is shorter than input_dimensions then the trailing
-        input_dimensions are not convolved over, are instead broadcast to all
-        outputs which are connected via the convolution in the other dimensions.
-        """
-        self.input_dimensions     = tuple(input_dimensions)
-        self.output_dimensions    = tuple(output_dimensions)
-        self.num_outputs          = np.product(self.output_dimensions)
-        self.coincidence_inc      = coincidence_inc
-        self.coincidence_dec      = coincidence_dec
-        self.permanence_threshold = permanence_threshold
-
-        if diag:
-            if isinstance(diag, str):
-                print(diag, "Synapse Parameters")
-            else:
-                print("Synapse Parameters")
-            print("\tInput -> Output shapes are",
-                            self.input_dimensions, '->', self.output_dimensions)
-
-            # TODO: Multiply both sides of the coincidence ratio by their
-            # greatest common demonimator and then have both sides of the ratio
-            # labeled as "Presynaptic coincidence threshold:  X Active : Y
-            # Silent" And then view the scale differently. What I should really
-            # do is use the ratio and scale as parameters and calculate the inc
-            # and dec.
-            coincidence_ratio = self.coincidence_inc / self.coincidence_dec
-            print('\tCoincidence Ratio', self.coincidence_inc, '/',
-                        self.coincidence_dec, '=', coincidence_ratio)
-
-        # Both inputs and outputs are identified by their flat-index, which is
-        # their index into their space after it's been flattened.  All outputs
-        # have the same number of inputs in their potential pool.
-
-        # self.sources[output-index][input-number] = input-index
-        # self.sources.shape = (num_outputs, num_inputs)
-        if radii is not None:
-            self.radii = radii
-            self.normally_distributed_connections(input_dimensions, output_dimensions, potential_pool, radii)
-            if diag:
-                print("\tDensity within 1/2/3 deviations: %.3g / %.3g / %.3g"%(
-                            self.potential_pool_density_1,
-                            self.potential_pool_density_2,
-                            self.potential_pool_density_3,))
-        else:
-            self.dense_connections(input_dimensions, output_dimensions, potential_pool)
-
-        self.num_inputs  = self.sources.shape[1]
-        # Random permanence and synapse initialization
-        self.permanences = np.random.random(self.sources.shape)
-        self.synapses    = self.permanences > self.permanence_threshold
-        self.reset()
-
-        if diag:
-            # TODO: Synapse Manager's init diag should print the potential pool fraction
-            # I'd like to to print: "XXX / YYYY"
-            #   where XXX is the size of the potential pool
-            #     and YYYY is the maximum size of the potential pool
-            #     and XXX/YYYY is the potential fraction.
-
-            if radii is not None:
-                print("\tRadii", tuple(radii), '\tNum Inputs', self.num_inputs)
-            else:
-                print('\tNum Inputs', self.num_inputs)
-
-    def reset(self):
-        self.inputs = np.zeros(self.sources.shape, dtype=np.bool)
-        # Refresh synapses too, incase it got modified and never updated
-        self.synapses = self.permanences > self.permanence_threshold
-
-    def convolution_connections(self, input_dimensions, column_dimensions, radii):
-        """
-        Sets up the sliding window receptive areas for the spatial pooler
-        Directly sets the sources array, no returned value.
-        """
-        assert(len(column_dimensions) == len(radii))
-
-        # Extended column shape to the input shape
-        column_dimensions = tuple(column_dimensions) + (1,)*(len(input_dimensions)-len(column_dimensions))
-
-        # Index offsets into the receptive field, neuron is at center
-        window_ranges = [slice(-r, r+1) for r in radii]
-        # Broadcast over entirety of extra/non-convolutional dimensions.
-        window_ranges += [slice(0, inp_extent) for inp_extent in input_dimensions[len(radii):]]
-        # window_index[input-dimension][:] = [coordinates of receptive field]
-        window_index = np.mgrid[window_ranges]
-        window_index = np.array([dim.flatten() for dim in window_index], dtype=np.float32)
-
-        # Find where the columns are in the input.  (NOTE Columns === Outputs)
-        # Assume that they are evenly spaced and that the input space wraps around
-        column_ranges = [slice(0, size) for size in column_dimensions]
-        # column_locations[input-dimension][:] = vector of locations in the input space, one for each column.
-        column_locations = [dim.flatten() for dim in np.mgrid[column_ranges]]
-        column_locations *= np.divide(input_dimensions, column_dimensions).reshape(len(input_dimensions), 1)
-
-        # Apply the window offsets to each column location and record the resulting indecies.
-        column_locations = column_locations.reshape(column_locations.shape + (1,))
-        window_index = window_index.reshape((window_index.shape[0], 1, window_index.shape[1]))
-        # index[neuron-index][:] = [input index vector]
-        index = column_locations + window_index     # Broadcasting
-        # print('window_index', window_index.shape, 'column_locations', column_locations.shape, 'index', index.shape)
-        index = np.array(np.rint(index), dtype=np.int64)
-
-        # Collapse the input dimension of the index into a single index into the flattened input.
-        index = np.ravel_multi_index(index, input_dimensions, mode='wrap')
-        self.sources = index
-
-    def subsample_connections(self, potential_pool):
-        """Randomly keep 'potential_pool' fraction of inputs to every output."""
-        if potential_pool <= 1:
-            num_inputs = int(round(self.sources.shape[1] * potential_pool))
-        else:
-            num_inputs = potential_pool
-        shuffled = np.random.permutation(self.sources.T)
-        shuffled = shuffled[:num_inputs, :]
-        self.sources = np.sort(shuffled, axis=0).T
-
-    def normally_distributed_connections(self, input_dimensions, column_dimensions, potential_pool, radii):
-        """
-        Connects each column to its inputs.
-
-        Sets the attribute self.inhibition_radii which is the radii, converted
-        into column space units.
-
-        This sets the following attributes:
-            potential_pool_density_1
-            potential_pool_density_2
-            potential_pool_density_3
-        Which measure the average fraction of inputs which are potentially
-        connected to each column, looking within the first three standard
-        deviations of the columns receptive field.  The areas are non-
-        overlapping.
-        """
-        assert(len(column_dimensions) == len(radii))
-        radii = np.array(radii)
-        input_space_size = np.product(input_dimensions)
-        # Clean up the potential_pool parameter.
-        if potential_pool <= 1:
-            potential_pool = potential_pool * input_space_size
-        potential_pool = int(round(potential_pool))
-
-        # Split the input space into topological and extra dimensions.
-        topo_dimensions  = input_dimensions[: len(column_dimensions)]
-        extra_dimensions = input_dimensions[len(column_dimensions) :]
-
-        num_columns    = int(np.product(column_dimensions))
-        self.sources   = np.empty((num_columns, potential_pool), dtype=np.int)
-
-        # Density Statistics
-        self.potential_pool_density_1 = 0
-        self.potential_pool_density_2 = 0
-        self.potential_pool_density_3 = 0
-        extra_area   = np.product(extra_dimensions)
-        num_inputs_1 = extra_area * math.pi * np.product(radii)
-        num_inputs_2 = extra_area * math.pi * np.product(2 * radii)
-        num_inputs_3 = extra_area * math.pi * np.product(3 * radii)
-        num_inputs_2 -= num_inputs_1
-        num_inputs_3 -= num_inputs_1 + num_inputs_2
-
-        # Find where the columns are in the input.  Extra input dimensions are
-        # not represented here.
-        column_ranges = [slice(0, size) for size in column_dimensions]
-        # column_locations[input-dimension][:] = vector locations in input
-        # space, one for each column.
-        column_locations = [dim.flatten() for dim in np.mgrid[column_ranges]]
-        padding   = radii   #
-        expand_to = np.subtract(topo_dimensions, np.multiply(2, padding))
-        column_spacing    = np.divide(expand_to, column_dimensions).reshape(len(topo_dimensions), 1)
-        column_locations *= column_spacing
-        column_locations += np.array(padding).reshape(len(topo_dimensions), 1)
-        self.inhibition_radii = radii / np.squeeze(column_spacing)
-
-        for column_index in range(num_columns):
-            center = column_locations[:, column_index]
-            # Make potential-pool many unique input locations.  This is an
-            # iterative process: sample the normal distribution, reject
-            # duplicates, repeat until done.  Working pool holds the
-            # intermediate input-coordinates until it's filled and ready to be
-            # spliced into self.sources[column-index, :]
-            working_pool  = np.empty((0, len(input_dimensions)), dtype=np.int)
-            empty_sources = potential_pool  # How many samples to take.
-            for attempt in range(10):
-                # Sample points from the input space and cast to valid indecies.
-                # Take more samples than are needed B/C some will not be viable.
-                topo_pool     = np.random.normal(center, radii, 
-                                    size=(max(256, 2*empty_sources), len(radii)))
-                topo_pool     = np.rint(topo_pool)   # Round towards center
-                out_of_bounds = np.where(np.logical_or(topo_pool < 0, topo_pool >= topo_dimensions))
-                topo_pool     = np.delete(topo_pool, out_of_bounds, axis=0)
-                extra_pool = np.random.uniform(0, extra_dimensions, size=(topo_pool.shape[0], len(extra_dimensions)))
-                extra_pool = np.floor(extra_pool) # Round down to stay in half open range [0, dim)
-                # Combine topo & extra dimensions into input space coordinates.
-                pool       = np.concatenate([topo_pool, extra_pool], axis=1)
-                pool       = np.array(pool, dtype=np.int)
-                # Add the points to the working pool
-                working_pool = np.concatenate([working_pool, pool], axis=0)
-                # Reject duplicates
-                working_pool  = np.unique(working_pool, axis=0)
-                empty_sources = potential_pool - working_pool.shape[0]
-                if empty_sources <= 0:
-                    break
-            else:
-                if empty_sources > .05 * potential_pool:
-                    raise ValueError("Not enough sources to fill potential pool.")
-                else:
-                    print("Warning: Could not find enough unique inputs, allowing %d duplicates..."%empty_sources)
-                    duplicates = np.random.randint(0, working_pool.shape[0], size=empty_sources)
-                    duplicates = working_pool[duplicates]
-                    working_pool = np.concatenate([working_pool, duplicates], axis=0)
-            working_pool = working_pool[:potential_pool, :] # Discard extra samples
-
-            # Measure some statistics about input density.
-            displacements = working_pool[:, :len(topo_dimensions)] - center
-            # Measure in terms of standard deviations of their distribution.
-            deviations = displacements / radii
-            distances  = np.sum(deviations**2, axis=1)**.5
-            pp_size_1  = np.count_nonzero(distances <= 1)
-            pp_size_2  = np.count_nonzero(np.logical_and(distances > 1, distances <= 2))
-            pp_size_3  = np.count_nonzero(np.logical_and(distances > 2, distances <= 3))
-            self.potential_pool_density_1 += pp_size_1 / num_inputs_1
-            self.potential_pool_density_2 += pp_size_2 / num_inputs_2
-            self.potential_pool_density_3 += pp_size_3 / num_inputs_3
-
-            # Flatten and write to output array.
-            working_pool = np.ravel_multi_index(working_pool.T, input_dimensions)
-            self.sources[column_index, :] = working_pool
-        self.potential_pool_density_1 /= num_columns
-        self.potential_pool_density_2 /= num_columns
-        self.potential_pool_density_3 /= num_columns
-
-    def dense_connections(self, input_dimensions, output_dimensions, potential_pool):
-        """
-        Connect every potential_pool inputs to every output.
-        Directly sets the sources array, no returned value.
-        """
-        input_space_size = np.product(input_dimensions)
-        input_space      = range(input_space_size)
-        if potential_pool <= 1:
-            potential_pool = potential_pool * input_space_size
-        potential_pool = int(round(potential_pool))
-        potential_pool = min(input_space_size, potential_pool)
-        num_outputs  = int(np.product(output_dimensions))
-        self.sources = np.empty((num_outputs, potential_pool), dtype=np.int)
-        for output in range(num_outputs):
-            self.sources[output] = np.random.choice(input_space, potential_pool, replace=False)
-
-    def compute(self, input_activity):
-        """
-        This uses the given presynaptic activity to determine the postsynaptic
-        excitment.
-
-        Returns the excitement as a flattened array.  
-                Reshape to output_dimensions if needed.
-        """
-        if isinstance(input_activity, tuple) or input_activity.shape != self.input_dimensions:
-            # It's significantly faster to make sparse inputs dense than to use
-            # np.in1d, especially since this does NOT discard inactive columns.
-            dense = np.zeros(self.input_dimensions, dtype=np.bool)
-            dense[input_activity] = True
-            input_activity = dense
-        else:
-            assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaks
-
-        # Gather the inputs, mask out disconnected synapses, and sum for excitements.
-
-        self.input_activity = input_activity.reshape(-1)
-        self.inputs         = self.input_activity[self.sources]
-
-        connected_inputs = np.logical_and(self.synapses, self.inputs)
-        excitment        = np.sum(connected_inputs, axis=1)
-        return excitment
-        return excitment.reshape(self.output_dimensions)
-
-    def compute_sparse(self, input_activity):
-        """
-        This uses the given presynaptic activity to determine the postsynaptic
-        excitment.
-
-        Returns the excitement as a flattened array.  
-                Reshape to output_dimensions if needed.
-        """
-        assert(isinstance(input_activity, tuple))
-
-        num_inputs = np.product(self.input_dimensions)
-        input_activity = np.ravel_multi_index(input_activity, self.input_dimensions)
-
-        input_set = set(input_activity)
-        vec = np.vectorize(input_set.__contains__, otypes=[np.bool])
-        self.inputs = vec(self.sources)
-
-        # Gather the inputs, mask out disconnected synapses, and sum for excitements.
-        connected_inputs = np.logical_and(self.synapses, self.inputs)
-        excitment        = np.sum(connected_inputs, axis=1)
-        return excitment
-        return excitment.reshape(self.output_dimensions)
-
-    def learn_outputs(self, output_activity):
-        """
-        Update permanences and then synapses.
-
-        Argument output_activity is index array
-        """
-        updates = np.choose(self.inputs[output_activity], 
-                            np.array([-self.coincidence_dec, self.coincidence_inc]))
-        updates = np.clip(updates + self.permanences[output_activity], 0.0, 1.0)
-        self.permanences[output_activity] = updates
-        self.synapses[output_activity]    = updates > self.permanence_threshold
-    learn = learn_outputs
-
-    def learn_inputs(self, output_activity):
-        """
-        Update permanences and then synapses.
-
-        Instead of decrementing permanences when then output fires without the
-        input, decrement when the input fires and the output doesn't.  This is
-        the difference bewtween P->Q and Q->P, or in this context:
-            neuron activation -> Proximal/Basal input
-              and
-            Apical input -> neuron activation
-
-        Argument output_activity is index array
-        """
-        # Find all inputs which coincided with the output.
-        # input_sources.shape = (num-active-outputs, num-input-synapses)
-        input_sources = self.sources[output_activity]
-        # Input activity is boolen, is the dense input for the current cycle
-        reinforce = self.input_activity[input_sources]
-        self.permanences[output_activity][reinforce] += self.coincidence_inc
-
-        # Find all inputs which did not coincide with the output.
-        output_inactivity = np.ones(self.num_outputs, dtype=np.bool)
-        output_inactivity[output_activity] = False
-        # These are the input sources for inactive outputs
-        inactive_input_sources = self.sources[output_inactivity]
-        # Input activity is boolen, is the dense input for the current cycle
-        depress = self.input_activity[inactive_input_sources]
-        self.permanences[output_inactivity][depress] -= self.coincidence_dec
-
-        self.synapses = self.permanences > self.permanence_threshold
-
-    def synapse_histogram(self, diag=True):
-        """Note: diag does NOT show the figure! use plt.show()"""
-        data = np.sum(self.synapses, axis=1)
-        hist, bins = np.histogram(data, 
-                        bins=self.num_inputs, 
-                        range=(0, self.num_inputs),
-                        density=True)
-        if diag:
-            import matplotlib.pyplot as plt
-            plt.figure(instance_tag + " Synapses")
-            plt.plot(bins[:-1], hist*100)
-            plt.title("Histogram of Synapse Counts")
-            plt.xlabel("Number of connected synapses")
-            plt.ylabel("Percent of segments")
-            # plt.show()
-        return hist, bins
-
-    def permanence_histogram(self, diag=True):
-        """Note: diag does NOT show the figure! use plt.show()"""
-        data = self.permanences.flatten()
-        hist, bins = np.histogram(data, 
-                        bins=50, 
-                        density=True)
-        if diag:
-            import matplotlib.pyplot as plt
-            plt.figure(instance_tag + " Permanences")
-            plt.plot(bins[1:], hist)
-            plt.title("Histogram of Permanences")
-            plt.xlabel("Permanence")
-            plt.ylabel("Percent of segments")
-            # plt.show()
-        return hist, bins
 
 class SpatialPoolerParameters(Parameters):
     parameters = [
-        "column_dimensions",
-        "radii",
-        "potential_pool",
-        "coincidence_inc",
-        "coincidence_dec",
+        "permanence_inc",
+        "permanence_dec",
         "permanence_thresh",
         "sparsity",
+        "potential_pool",
         "boosting_alpha",
     ]
     def __init__(self,
-        column_dimensions,
-        coincidence_inc     = 0.04,
-        coincidence_dec     = 0.01,
+        permanence_inc     = 0.04,
+        permanence_dec     = 0.01,
         permanence_thresh   = 0.4,
-        radii               = None,
-        potential_pool      = None,
+        potential_pool      = 2048,
         sparsity            = 0.02,
-        boosting_alpha      = 0.001, ):
+        boosting_alpha      = 0.001,):
         """
-        TODO: Copy the docstring from SynapseManager down to here.
-
-        Argument radii is the standard deviation of the gaussian window which
-        defines the local neighborhood of a column.  The radii determine which
-        inputs are likely to be in a columns potential pool.
-        In a normal distribution:
-            68% of area is within one standard deviation
-            95% of area is within two standard deviations
-                  This what's currently done.
-            99% of area is within three standard deviations
+        This class contains the global parameters, which are invariant between
+        different cortical regions.  The column dimensions and radii are stored
+        elsewhere.
 
         Argument boosting_alpha is the small constant used by the moving 
                  exponential average which tracks each columns activation 
                  frequency.
         """
-        # Get the parent class to save all these parameters.
-        kw_args = locals().copy()
+        # Get the parent class to save all these parameters as attributes of the same name.
+        kw_args = locals()
+        # Double underscores are magic and come and go as they please.  Filter them all out.
+        dunder  = lambda name: name.startswith('__') and name.endswith('__')
+        kw_args = {k:v for k,v in kw_args.items() if not dunder(k)}
         del kw_args['self']
-        del kw_args['__class__']
         super().__init__(**kw_args)
 
-class SpatialPooler(SaveLoad):
+class SpatialPooler:
     """
     This class handles the mini-column structures and the feed forward 
     proximal inputs to each cortical mini-column.
-
 
     This implementation is based on but differs from the one described by
     Numenta's Spatial Pooler white paper, (Cui, Ahmad, Hawkins, 2017, "The HTM
     Spatial Pooler - a neocortical...") in two main ways, the boosting function
     and the local inhibition mechanism.
 
-
     Logarithmic Boosting Function:
-
     This uses a logarithmic boosting function.  Its input is the activation
     frequency which is in the range [0, 1] and its output is a boosting factor
     to multiply each columns excitement by.  It's equation is:
@@ -1401,18 +65,19 @@ class SpatialPooler(SaveLoad):
     Some things to note:
         1) The boost factor asymptotically approaches infinity as the activation
            frequency approaches zero.
-        2) The boost factor equals zero when the actiavtion frequency of one.
+        2) The boost factor equals zero when the actiavtion frequency is one.
         3) The boost factor for columns which are at the target activation 
            frequency is one.  
         4) This mechanism has a single parameter: boosting_alpha which controls
            the exponential moving average which tracks the activation frequency.
 
-
     Fast Local Inhibition:
-    This activates the top K most excited columns globally, after normalizing
-    all columns by their local area mean and standard deviation.  The local area
-    is a gaussian window and the standard deviation of the gaussian is
-    proportional to the radius of the receptive field.
+    This activates the most excited columns globally, after normalizing all
+    columns by their local area mean and standard deviation.  The local area is
+    a gaussian window and the standard deviation of it is proportional to the
+    deviation which is used to make the receptive fields of each column.
+    Columns inhibit each other in proportion to the number of inputs which they
+    share.
 
     In pseudo code:
     1.  mean_normalized = excitement - gaussian_blur( excitement, radius )
@@ -1420,89 +85,97 @@ class SpatialPooler(SaveLoad):
     3.  normalized = mean_normalized / standard_deviation
     4.  activate = top_k( normalized, sparsity * number_of_columns )
     """
-    data_extension = '.sp'
-
     stability_st_period = 1000
     stability_lt_period = 10       # Units: self.stability_st_period
 
-    def __init__(self, parameters, input_dimensions, stability_sample_size=0):
+    def __init__(self, parameters, input_sdr, column_sdr,
+        radii=None,
+        stability_sample_size=0,
+        multisegment_experiment=None):
         """
         Argument parameters is an instance of SpatialPoolerParameters.
+
+        Argument input_sdr ...
+        Argument column_sdr ...
+
+        Argument radii is the standard deviation of the gaussian window which
+                 defines the local neighborhood of a column.  The radii
+                 determine which inputs are likely to be in a columns potential
+                 pool.  If radii is None then topology is disabled.  See
+                 SynapseManager.normally_distributed_connections for details
+                 about topology.
 
         Argument stability_sample_size, set to 0 to disable stability
                  monitoring, default is off.  
         """
         assert(isinstance(parameters, SpatialPoolerParameters))
+        assert(isinstance(input_sdr, SDR))
+        assert(isinstance(column_sdr, SDR))
         self.args = args           = parameters
-        self.input_dimensions      = tuple(input_dimensions)
-        self.column_dimensions     = tuple(int(round(cd)) for cd in args.column_dimensions)
-        self.num_columns           = np.product(self.column_dimensions)
-        self.topology              = args.radii is not None
+        self.inputs                = input_sdr
+        self.columns               = column_sdr
+        self.topology              = radii is not None
         self.age                   = 0
         self.stability_schedule    = [0] if stability_sample_size > 0 else [-1]
         self.stability_sample_size = stability_sample_size
         self.stability_samples     = []
 
-        if False:
-            self.proximal = SynapseManager(self.input_dimensions, 
-                                            self.column_dimensions,
-                                            args.radii,
-                                            potential_pool=args.potential_pool,
-                                            diag=False)
+        self.multisegment = multisegment_experiment is not None
+        if self.multisegment:
+            # EXPERIMENTIAL: Multi-segment proximal dendrites.
+            self.segments_per_cell = int(round(multisegment_experiment))
+            self.proximal = SynapseManager( self.inputs,
+                                            SDR(self.columns.dimensions + (self.segments_per_cell,),
+                                                activation_frequency_alpha=args.boosting_alpha),    # DEBUG
+                                            permanence_inc    = args.permanence_inc,
+                                            permanence_dec    = args.permanence_dec,
+                                            permanence_thresh = args.permanence_thresh,)
         else:
-            self.proximal = htm_cython.SynapseManager_implicit_synapse(
-                                            self.input_dimensions, 
-                                            self.column_dimensions,
-                                            args.radii,
-                                            potential_pool=args.potential_pool,
-                                            diag=False)
-        self.proximal.coincidence_inc    = args.coincidence_inc
-        self.proximal.coincidence_dec    = args.coincidence_dec
-        self.proximal.permanence_thresh  = args.permanence_thresh
-        self.proximal.reset()   # Updates self.proximal.synapses w/ new threshold
+            self.proximal = SynapseManager( self.inputs,
+                                            self.columns,
+                                            permanence_inc    = args.permanence_inc,
+                                            permanence_dec    = args.permanence_dec,
+                                            permanence_thresh = args.permanence_thresh,)
+        if self.topology:
+            r = self.proximal.normally_distributed_connections(args.potential_pool, radii)
+            self.inhibition_radii = r
+        else:
+            self.proximal.uniformly_distributed_connections(args.potential_pool)
 
-        # Initialize to the target activation frequency/sparsity.
-        self.average_activations = np.full(self.num_columns, args.sparsity, dtype=np.float)
-        self.output = ()
+        if args.boosting_alpha is not None:
+            # Make a dedicated SDR to track column activation frequencies for
+            # boosting.
+            self.boosting = SDR(self.columns,
+                                activation_frequency_alpha = args.boosting_alpha,
+                                # Note: average overlap is useful to know, but is not part of the boosting algorithm.
+                                average_overlap_alpha      = args.boosting_alpha,)
+            # Initialize to the target activation frequency/sparsity.
+            self.boosting.activation_frequency.fill(args.sparsity)
 
-    def compute(self, input_sdr, focus=None, learn=True, diag=False):
+    def compute(self, input_sdr=None):
         """
-        Returns tuple of column indecies
-
-        Note: this methods diags are built for 2D image processing and will not
-        work with other types/dimensions of data.  
         """
         args = self.args
-        if True:    # Works
-            self.zz_raw = raw_excitment = self.proximal.compute(input_sdr)
-        else:       # Does not work
-            self.zz_raw = raw_excitment = self.proximal.compute_sparse(input_sdr)
-            # dense_method = self.proximal.compute(input_sdr)
-            # assert(np.all(raw_excitment == dense_method))
+        if self.multisegment:
+            # EXPERIMENT: Multi segment proximal dendrites.
+            raw_excitment = self.proximal.compute(input_sdr=input_sdr)
+            self.segment_excitement = raw_excitment
+            # Replace the segment dimension with each columns most excited segment.
+            raw_excitment = np.max(raw_excitment, axis=-1)
+            raw_excitment = raw_excitment.reshape(-1)
+        else:
+            raw_excitment = self.proximal.compute(input_sdr=input_sdr).reshape(-1)
 
-        # Logarithmic Boosting Function
-        #
-        # Disable boosting during evaluations unless topology is a factor.
-        #
-        # Apply boosting during evaluations if there is a topology because
-        # boosting makes the local inhibition algorithm work better.  Boosting
-        # corrects for neurons which are systematically under/over-excited.
-        # Without boosting the mean excitement in an area is pulled down by
-        # outliers, the std-dev increases, the true outliers --correct column
-        # activations-- are then divided by too large of a std dev to compete
-        # with areas which have more homogenous excitements.  Those areas with
-        # more equal excitements tend to be areas with fewer and less
-        # interesting inputs available.
-        #
-        if learn or self.topology:
-            boost = np.log2(self.average_activations) / np.log2(args.sparsity)
+        # Logarithmic Boosting Function.
+        if args.boosting_alpha is not None:
+            boost = np.log2(self.boosting.activation_frequency) / np.log2(args.sparsity)
             boost = np.nan_to_num(boost)
-            self.zz_boostd = raw_excitment = boost * raw_excitment
+            raw_excitment = boost * raw_excitment
 
         # Fast Local Inhibition
         if self.topology:
-            inhibition_radii    = self.proximal.inhibition_radii
-            raw_excitment       = raw_excitment.reshape(self.column_dimensions)
+            inhibition_radii    = self.inhibition_radii
+            raw_excitment       = raw_excitment.reshape(self.columns.dimensions)
             avg_local_excitment = scipy.ndimage.filters.gaussian_filter(
                                     # Truncate for speed
                                     raw_excitment, inhibition_radii, mode='reflect', truncate=3.0)
@@ -1510,139 +183,60 @@ class SpatialPooler(SaveLoad):
             stddev              = np.sqrt(scipy.ndimage.filters.gaussian_filter(
                                     local_excitment**2, inhibition_radii, mode='reflect', truncate=3.0))
             raw_excitment       = np.nan_to_num(local_excitment / stddev)
-            self.zz_norm        = raw_excitment.reshape(self.column_dimensions)
-            raw_excitment       = raw_excitment.flatten()
+            raw_excitment       = raw_excitment.reshape(-1)
 
-        # FOCUS
-        #
-        # Focus is applied after the local inhibition step. The idea is that
-        # this overrides local inhibition. Boosting is applied before local
-        # inhibition because (1) it corrects  for systematic over/under
-        # excitement, and (2) it's goal is to encourage individual columns to
-        # participate more which yields a better representation. However the
-        # focus mechanism should be able to boost entire areas of interest.  Its
-        # goal is to bias more useful neurons towards activating which helps
-        # other areas by filtering out noise.  Blank areas of the image can be
-        # considered noise.
-        #
-        if focus is not None:
-            apical_excitement = self.apical.compute(focus)
-            mf = self.focus_max
-            a  = mf / self.focus_satur
-            zz_focus = (1 + np.minimum(mf, a * apical_excitement))
-            zz_focused = raw_excitment = raw_excitment * zz_focus
+        # EXPERIMENTIAL
+        self.raw_excitment = raw_excitment
 
         # Activate the most excited columns.
         #
-        k = int(round(self.num_columns * args.sparsity))
-        k = max(k, 1)
-        self.active_columns = np.argpartition(-raw_excitment, k-1)[:k]
+        # Note: excitements are not normally distributed, their local
+        # neighborhoods use gaussian windows, which are a different thing. Don't
+        # try to use a threshold, it won't work.  Especially not: threshold =
+        # scipy.stats.norm.ppf(1 - sparsity).
+        k = self.columns.size * args.sparsity
+        k = max(1, int(round(k)))
+        self.columns.flat_index = np.argpartition(-raw_excitment, k-1)[:k]
+        return self.columns
 
-        unflat_output = np.unravel_index(self.active_columns, self.column_dimensions)
-
-        if learn:
-            # Update the exponential moving average of each columns activation frequency.
-            alpha = args.boosting_alpha
-            self.average_activations *= (1 - alpha)                 # Decay with time
-            self.average_activations[self.active_columns] += alpha  # Incorperate this sample
-
-            # Update proximal synapses and their permenances.
-            self.proximal.learn(self.active_columns)
-
-            if focus is not None:
-                self.apical.learn_inputs(self.active_columns)
-
-            self.stability(input_sdr, unflat_output)
-
-            self.age += 1
-
-        if diag:
-            # Make sparse input dense
-            if isinstance(input_sdr, tuple) or input_sdr.shape != args.input_dimensions:
-                dense = np.zeros(args.input_dimensions, dtype=np.bool)
-                dense[input_sdr] = True
-                input_sdr = dense
-            # Make input a valid image, even if that means dropping feature layers.
-            if len(input_sdr.shape) == 3 and input_sdr.shape[2] not in (1, 3):
-                input_sdr = input_sdr[:,:,0]
-
-            from matplotlib import pyplot as plt
-            plt.figure(instance_tag + " SP pipeline (%s)"%random_tag())
-            plt.subplot(2, 3, 1)
-            plt.imshow(input_sdr, interpolation='nearest')
-            plt.title("Input")
-
-            plt.subplot(2, 3, 2)
-            if focus is None:
-                plt.imshow(self.zz_raw.reshape(self.column_dimensions), interpolation='nearest')
-                plt.title('Raw Excitement, radius ' + str(self.args.adii))
-            else:
-                hist, bins = np.histogram(self.zz_boostd, 
-                                bins=self.proximal.num_inputs, 
-                                range=(0, self.proximal.num_inputs),
-                                density=True)
-                fhist, fbins = np.histogram(zz_focused, 
-                                bins=self.proximal.num_inputs, 
-                                range=(0, self.proximal.num_inputs),
-                                density=True)
-                plt.plot(bins[:-1], hist*100, 'r', fbins[:-1], fhist*100, 'g')
-                plt.title("Histogram of Excitement\nRed = Boosted, Green = Focused")
-                plt.xlabel("Postsynaptic Excitement")
-                plt.ylabel("Percent of columns")
-
-            plt.subplot(2, 3, 3)
-            if learn:
-                plt.imshow(self.zz_boostd.reshape(self.column_dimensions),
-                            interpolation='nearest')
-                plt.title('Boosted (alpha = %g)'%self.average_activations_alpha)
-            else:
-                plt.imshow(self.average_activations.reshape(self.column_dimensions),
-                            interpolation='nearest')
-                plt.title('Average Duty Cycle (alpha = %g)'%self.average_activations_alpha)
-
-            if focus is not None:
-                plt.subplot(2, 3, 4)
-                plt.imshow(zz_focus.reshape(self.column_dimensions), interpolation='nearest')
-                plt.title('Apical Excitement')
-
-            if args.topology:
-                plt.subplot(2, 3, 5)
-                plt.imshow(self.zz_norm, interpolation='nearest')
-                plt.title('Locally Inhibited Excitement')
-
-            plt.subplot(2, 3, 6)
-            active_state_visual = np.zeros(self.column_dimensions)
-            active_state_visual[unflat_output] = 1
-            plt.imshow(np.dstack([active_state_visual]*3), interpolation='nearest')
-            plt.title("Active Columns (%d train cycles)"%self.age)
-
-            if True:
-                # Useful for testing boosting functions.
-                self.print_activation_fequency()
-
-            if focus is not None:
-                print('Apical boost min ',  np.min(zz_focus) * 100, '%')
-                print('Apical boost mean', np.mean(zz_focus) * 100, '%')
-                print('Apical boost std ',  np.std(zz_focus) * 100, '%')
-                print('Apical boost max ',  np.max(zz_focus) * 100, '%')
-
-        # Keep this around a little while because it's useful.
-        # if learn:     # I don't know why this was here.
-        self.output = unflat_output
-
-        return unflat_output
-
-    def make_output_dense(self, output=None):
+    def learn(self, input_sdr=None, column_sdr=None):
         """
-        Returns the output as a dense boolean ndarray.
-        If no output is given, uses the most recently computed output.
+        Make the spatial pooler learn about its current inputs and active columns.
         """
-        if output is None:
-            output = np.unravel_index(self.active_columns, self.column_dimensions)
-        output = np.array(output)
-        dense = np.zeros(self.column_dimensions, dtype=np.bool)
-        dense[output] = True
-        return dense
+        if self.multisegment:
+            self.columns.assign(column_sdr)
+            segment_excitement = self.segment_excitement[self.columns.index]
+            seg_idx = np.argmax(segment_excitement, axis=-1)
+            self.proximal.learn_outputs(input_sdr=input_sdr,
+                                        output_sdr=self.columns.index + (seg_idx,))
+        else:
+            # Update proximal synapses and their permanences.  Also assigns into our column SDR.
+            self.proximal.learn_outputs(input_sdr=input_sdr, output_sdr=column_sdr)
+        # Update the exponential moving average of each columns activation frequency.
+        self.boosting.assign(self.columns)
+        # Book keeping.
+        self.stability(self.inputs, self.columns.index)
+        self.age += 1
+
+    def stabilize(self, prior_columns, percent):
+        """
+        This activates prior columns to force active in order to maintain
+        the given percent of column overlap between time steps.  Always call
+        this between compute and learn!
+        """
+        num_active      = (len(self.columns) + len(prior_columns)) / 2
+        overlap         = self.columns.overlap(prior_columns)
+        stabile_columns = int(round(num_active * overlap))
+        target_columns  = int(round(num_active * percent))
+        add_columns     = target_columns - stabile_columns
+        if add_columns <= 0:
+            return
+
+        eligable_columns  = np.setdiff1d(prior_columns.flat_index, self.columns.flat_index)
+        eligable_excite   = self.raw_excitment[eligable_columns]
+        selected_col_nums = np.argpartition(-eligable_excite, add_columns-1)[:add_columns]
+        selected_columns  = eligable_columns[selected_col_nums]
+        self.columns.flat_index = np.concatenate([self.columns.flat_index, selected_columns])
 
     def plot_boost_functions(self, beta = 15):
         # Generate sample points
@@ -1659,24 +253,6 @@ class SpatialPooler(SaveLoad):
         ax.set_xlabel("Activation Frequency")
         ax.set_ylabel("Boost Factor")
         plt.show()
-
-    def entropy(self, diag=True):
-        """
-        Calculates the entropy of column activations.
-
-        Result is normalized to range [0, 1]
-        A value of 1 indicates that all columns are equally and fully utilized.
-        """
-        p = self.average_activations
-        def entropy(p):
-            # Binary entroy function
-            p_ = (1 - p)
-            s = -p*np.log2(p) -p_*np.log2(p_)
-            return np.mean(np.nan_to_num(s))
-        e = entropy(p) / entropy(self.args.sparsity)
-        if diag:
-            print("Inst. SP Entropy %g"%e)
-        return e
 
     def stability(self, input_sdr, output_sdr, diag=True):
         """
@@ -1726,6 +302,8 @@ class SpatialPooler(SaveLoad):
             return
         # Else: calculate the stability and setup for the next period of 
         # stability sampling & monitoring.  
+
+        assert(False) # This method probably won't work since changes to use SDR class...
 
         def overlap(a, b):
             a = set(zip(*a))
@@ -1845,62 +423,185 @@ class SpatialPooler(SaveLoad):
 
         return noises, pct_over
 
-    def activation_fequency(self, diag=True):
-        f = self.average_activations.reshape(self.column_dimensions)
-        plt.figure(instance_tag + ' Duty Cycles')
-        plt.imshow(f, interpolation='nearest')
-        plt.title('Average Activation Frequency (alpha = %g)'%self.average_activations_alpha)
-        return f
+    def statistics(self):
+        stats = 'SP '
+        stats += self.proximal.statistics()
 
-    def print_activation_fequency(self):
-        aa = self.average_activations
-        boost_min  = np.log2(np.min(aa))  / np.log2(self.args.sparsity)
-        boost_mean = np.log2(np.mean(aa)) / np.log2(self.args.sparsity)
-        boost_max  = np.log2(np.max(aa))  / np.log2(self.args.sparsity)
-        print('duty cycle min  %-.04g'%( np.min(aa)*100), '%', ' log-boost %.04g'%boost_min)
-        print('duty cycle mean %-.04g'%(np.mean(aa)*100), '%', ' log-boost %.04g'%boost_mean)
-        print('duty cycle std  %-.04g'%( np.std(aa)*100), '%')
-        print('duty cycle max  %-.04g'%( np.max(aa)*100), '%', ' log-boost %.04g'%boost_max)
+        if self.args.boosting_alpha is not None:
+            stats      += 'Columns ' + self.boosting.statistics()
+            af         = self.boosting.activation_frequency
+            boost_min  = np.log2(np.min(af))  / np.log2(self.args.sparsity)
+            boost_mean = np.log2(np.mean(af)) / np.log2(self.args.sparsity)
+            boost_max  = np.log2(np.max(af))  / np.log2(self.args.sparsity)
+            stats += '\tLogarithmic Boosting Multiplier min/mean/max  {:-.04g}% / {:-.04g}% / {:-.04g}%\n'.format(
+                    boost_min   * 100,
+                    boost_mean  * 100,
+                    boost_max   * 100,)
 
-    def __str__(self):
-        # TODO: This method is useless but I do want the density printouts.
-        st = ["Spatial Pooler Parameters"]
-        max_param = max(len(p) for p in self.parameters) + 2
-        for p in sorted(self.args.parameters):
-            pad = max_param - len(p)
-            st.append('\t'+p+' '+ '.'*pad +' '+ str(getattr(self, p, None)))
-        p = 'density 1/2/3'
-        st.append('\t'+p+'.'*(max_param - len(p)) + "%.3g / %.3g / %.3g"%(
-                            self.proximal.potential_pool_density_1,
-                            self.proximal.potential_pool_density_2,
-                            self.proximal.potential_pool_density_3,))
-        return '\n'.join(st)
+        # TODO: Stability, if enabled.
+        pass
+
+        # TODO: Noise robustness, if enabled.
+        pass
+
+        return stats
 
 
-"""
-Outstanding Tasks for T.M.
+class Dendrite:
+    """
+    """
+    def __init__(self, input_sdr, active_sdr,
+        segments_per_cell,
+        synapses_per_segment,
+        predictive_threshold,
+        learning_threshold,
+        permanence_thresh,
+        permanence_inc,
+        permanence_dec,
+        mispredict_dec,
+        add_synapses,
+        initial_segment_size,
+        ):
+        """!"""
+        # TODO: copy the docstrings from synapse manager since this is a pass through
+        assert(isinstance(input_sdr, SDR))
+        assert(isinstance(active_sdr, SDR))
+        self.input_sdr            = input_sdr
+        self.active_sdr           = active_sdr
+        self.segments_per_cell    = int(round(segments_per_cell))
+        self.synapses_per_segment = int(round(synapses_per_segment))
+        self.add_synapses         = int(round(add_synapses))
+        self.initial_segment_size = int(round(initial_segment_size))
+        self.predictive_threshold = predictive_threshold
+        self.learning_threshold   = learning_threshold
 
-Nupic has a bunch of rules to determine which segment learns when a column bursts
+        self.synapses = SynapseManager(
+            input_sdr         = input_sdr,
+            output_sdr        = SDR((self.active_sdr.size, self.segments_per_cell)),
+            permanence_thresh = permanence_thresh,
+            permanence_inc    = permanence_inc,
+            permanence_dec    = permanence_dec,)
+        self.mispredict_dec   = mispredict_dec
 
-synapses_per_segment unimplemetned
+    def compute(self, input_sdr=None):
+        self.excitement          = self.synapses.compute(input_sdr=input_sdr)
+        self.predictive_segments = self.excitement >= self.predictive_threshold
+        self.predictions         = np.sum(self.predictive_segments, axis=1)
+        return self.predictions.reshape(self.active_sdr.dimensions)
 
-The TM is going to need continuously running metrics, much like the SP's metrics
-* instantaneous anomally, exponential average anomally
-* instantaneous input overlap? exponential average input overlap?
-"""
+    def learn(self, active_sdr=None,):
+        """!"""
+        self.active_sdr.assign(active_sdr)
+        self._mispredict()
+        self._reinforce()
+        self._add_synapses()   # Call reinforce before add_synapses!
+
+    def _mispredict(self):
+        """
+        All mispredicted segments receive a small permanence penalty (predictive
+        segments in inactive neurons).  This penalizes only the synapses with
+        active presynapses.
+        """
+        mispredictions = np.array(self.predictive_segments)
+        mispredictions[self.active_sdr.flat_index] = 0
+        self.synapses.learn_outputs(output_sdr     = mispredictions,
+                                    permanence_inc = -self.mispredict_dec,
+                                    permanence_dec = 0,)
+
+    def _reinforce(self):
+        """
+        Reinforce segments which correctly predicted their neurons activation.
+        Allows all segments which meet the learning threshold to learn.
+        """
+        self.learning_segments = self.excitement[self.active_sdr.flat_index] >= self.learning_threshold
+        active_num, seg_idx    = np.nonzero(self.learning_segments)
+        active_idx             = self.active_sdr.flat_index[active_num]
+        self.synapses.learn_outputs(output_sdr = (active_idx, seg_idx),)
+
+    def _add_synapses(self):
+        # Add more synapses to learning segments in neurons which are both
+        # active and unpredicted.
+        unpred_active_mask = np.logical_not(self.predictions[self.active_sdr.flat_index])
+        neur_num, seg_idx  = np.nonzero(self.learning_segments[unpred_active_mask])
+        neur_idx           = self.active_sdr.flat_index[neur_num]
+        self.synapses.add_synapses(
+            output_sdr          = (neur_idx, seg_idx),
+            synapses_per_output = self.add_synapses,
+            maximum_synapses    = self.synapses_per_segment)
+
+        # Start new segments on active neurons with no learning segments. Use
+        # the segments with the fewest existing synapses, which improves the
+        # amount of room for the new segment to grow as well as evenly
+        # distributes synapses amongst the segments.
+        need_more_segments_mask = np.logical_not(np.any(self.learning_segments, axis=1))
+        neur_idx                = self.active_sdr.flat_index[need_more_segments_mask]
+        if len(neur_idx):
+            segment_sources     = self.synapses.postsynaptic_sources.reshape(self.synapses.outputs.dimensions)
+            segment_sizes       = np.array([[seg.shape[0] for seg in seg_slice]
+                                    for seg_slice in segment_sources[neur_idx, :]])
+            seg_idx             = np.argmin(segment_sizes, axis=1)
+            self.synapses.add_synapses(
+                    output_sdr          = (neur_idx, seg_idx),
+                    synapses_per_output = self.initial_segment_size,
+                    maximum_synapses    = self.synapses_per_segment)
+
+    def statistics(self):
+        stats = ''
+
+        # TODO: These should report both the individual neuron and the
+        # population wide error rates.  (multiply by pop size?)
+        stats += 'Theoretic False Positive Rate  {:g}\n'.format(
+            float(self.synapses.inputs.false_positive_rate(
+                self.synapses_per_segment,
+                self.predictive_threshold,
+            ))
+        )
+        for noise in [5, 10, 20, 50]:
+            stats += 'Theoretic False Negative Rate, {}% noise, {:g}\n'.format(
+                noise,
+                float(self.synapses.inputs.false_negative_rate(
+                    noise/100,
+                    self.initial_segment_size,
+                    self.predictive_threshold,
+                ))
+            )
+        return stats
+
+
 class TemporalMemoryParameters(Parameters):
     parameters = [
+        'add_synapses',             # How many new synapses to add to subthreshold learning segments.
         'cells_per_column',
+        'initial_segment_size',     # How many synases to start new segments with.
         'segments_per_cell',
-        # 'synapses_per_segment',       # TODO
+        'synapses_per_segment',
         'permanence_inc',
         'permanence_dec',
         'mispredict_dec',
         'permanence_thresh',
-        'predictive_threshold',     # Segment excitement threshold for predictions
-        'learning_threshold',       # Segment excitement threshold for learning
-        'burst_cells_to_connect',   # Fraction of unpredicted input to add to new segments.
+        'predictive_threshold',     # Segment excitement threshold for predictions.
+        'learning_threshold',       # Segment excitement threshold for learning.
     ]
+    def __init__(self,
+        cells_per_column        = 1.022e+01,
+        learning_threshold      = 7.215e+00,
+        mispredict_dec          = 1.051e-03,
+        permanence_dec          = 9.104e-03,
+        permanence_inc          = 2.272e-02,
+        permanence_thresh       = 2.708e-01,
+        predictive_threshold    = 6.932e+00,
+        segments_per_cell       = 1.404e+02,
+        synapses_per_segment    = 1.190e+02,
+        add_synapses            = 1,
+        initial_segment_size    = 10,
+        ):
+        # Get the parent class to save all these parameters as attributes of the same name.
+        kw_args = locals()
+        # Double underscores are magic and come and go as they please.  Filter them all out.
+        dunder  = lambda name: name.startswith('__') and name.endswith('__')
+        kw_args = {k:v for k,v in kw_args.items() if not dunder(k)}
+        del kw_args['self']
+        super().__init__(**kw_args)
 
 class TemporalMemory:
     """
@@ -1910,75 +611,125 @@ class TemporalMemory:
     """
     def __init__(self, 
         parameters,
-        column_dimensions,):
+        column_sdr,
+        apical_sdr=None,
+        inhibition_sdr=None,
+        context_sdr=None,
+        ):
         """
         Argument parameters is an instance of TemporalMemoryParameters
         Argument column_dimensions ...
         """
+        assert(isinstance(parameters, TemporalMemoryParameters))
         self.args = args         = parameters
-        self.column_dimensions   = tuple(int(round(cd)) for cd in column_dimensions)
+        assert(isinstance(column_sdr, SDR))
+        self.columns             = column_sdr
         self.cells_per_column    = int(round(args.cells_per_column))
+        if self.cells_per_column < 1:
+            raise ValueError("Cannot create TemporalMemory with cells_per_column < 1.")
         self.segments_per_cell   = int(round(args.segments_per_cell))
-        self.num_columns         = np.product(self.column_dimensions)
-        # self.num_neurons         = self.cells_per_column * self.num_columns   # UNUSED?
-        self.output_shape        = (self.num_columns, self.cells_per_column)
-        self.anomaly_alpha       = .1
+        self.active              = SDR((self.columns.size, self.cells_per_column),
+                                        activation_frequency_alpha = 1/1000,
+                                        average_overlap_alpha      = 1/1000,)
+        self.anomaly_alpha       = 1/1000
         self.mean_anomaly        = 0
 
-        # SYNAPSE MANAGER
-        self.input_dimensions     = (self.num_columns, self.cells_per_column,)
-        self.output_dimensions    = (self.num_columns, self.cells_per_column, self.segments_per_cell,)
-        self.num_inputs           = np.product(self.input_dimensions)
-        self.num_outputs          = np.product(self.output_dimensions)
-        self.permanence_inc       = self.args.permanence_inc
-        self.permanence_dec       = self.args.permanence_dec
-        self.permanence_threshold = self.args.permanence_thresh
+        self.basal = Dendrite(
+            input_sdr            = context_sdr if context_sdr is not None else self.active,
+            active_sdr           = self.active,
+            segments_per_cell    = args.segments_per_cell,
+            synapses_per_segment = args.synapses_per_segment,
+            initial_segment_size = args.initial_segment_size,
+            add_synapses         = args.add_synapses,
+            learning_threshold   = args.learning_threshold,
+            predictive_threshold = args.predictive_threshold,
+            permanence_inc       = args.permanence_inc,
+            permanence_dec       = args.permanence_dec,
+            permanence_thresh    = args.permanence_thresh,
+            mispredict_dec       = args.mispredict_dec,)
 
-        self.sources     = np.empty((self.num_columns, self.cells_per_column, self.segments_per_cell,), dtype=object)
-        self.permanences = np.empty_like(self.sources)
-        for idx in np.ndindex(self.sources.shape):
-            self.sources[idx]     = np.zeros((0,), dtype=np.int)
-            self.permanences[idx] = np.zeros((0,), dtype=np.float)
+        if apical_sdr is None:
+            self.apical = None
+        else:
+            assert(isinstance(apical_sdr, SDR))
+            self.apical = Dendrite(
+                input_sdr            = apical_sdr,
+                active_sdr           = self.active,
+                segments_per_cell    = args.segments_per_cell,
+                synapses_per_segment = args.synapses_per_segment,
+                initial_segment_size = args.initial_segment_size,
+                add_synapses         = args.add_synapses,
+                learning_threshold   = args.learning_threshold,
+                predictive_threshold = args.predictive_threshold,
+                permanence_inc       = args.permanence_inc,
+                permanence_dec       = args.permanence_dec,
+                permanence_thresh    = args.permanence_thresh,
+                mispredict_dec       = args.mispredict_dec,)
+
+        if inhibition_sdr is None:
+            self.inhibition = None
+        else:
+            assert(isinstance(inhibition_sdr, SDR))
+            self.inhibition = Dendrite(
+                input_sdr            = inhibition_sdr,
+                active_sdr           = self.active,
+                segments_per_cell    = args.segments_per_cell,
+                synapses_per_segment = args.synapses_per_segment,
+                initial_segment_size = args.initial_segment_size,
+                add_synapses         = args.add_synapses,
+                learning_threshold   = args.learning_threshold,
+                predictive_threshold = args.predictive_threshold,
+                permanence_inc       = args.permanence_inc,
+                permanence_dec       = args.permanence_dec,
+                permanence_thresh    = args.permanence_thresh,
+                mispredict_dec       = 0,) # Is not but should be an inhibited segment in an active cell.
+
         self.reset()
 
     def reset(self):
-        # Zero the input space
-        self.inputs = np.empty_like(self.sources)
-        for idx in np.ndindex(self.sources.shape):
-            self.inputs[idx] = np.zeros(self.sources[idx].shape, dtype=np.bool)
+        self.active.zero()
+        self.reset_state = True
 
-        # Refresh synapses too, incase it got modified and never updated
-        threshold = self.permanence_threshold
-        self.synapses = np.empty_like(self.sources)
-        for idx in np.ndindex(self.sources.shape):
-            self.synapses[idx] = self.permanences[idx] > threshold
-
-        self.excitement  = np.zeros((self.num_columns, self.cells_per_column, self.segments_per_cell), dtype=np.int)
-        self.active      = np.empty((2, 0), dtype=np.int)
-        self.predictions = np.zeros((self.num_columns, self.cells_per_column), dtype=np.bool)
-
-    def compute(self, column_activations):
+    def compute(self,
+        context_sdr=None,
+        column_sdr=None,
+        apical_sdr=None,
+        inhibition_sdr=None,):
         """
-        Argument column_activations is an index of active columns.
-
-        Returns active neurons as pair (flat-column-index, neuron-index)
-
-        This sets the attributes anomaly and mean_anomaly.
+        Attribute anomaly, mean_anomaly are the fraction of neuron activations
+                  which were predicted.  Range [0, 1]
         """
         ########################################################################
-        # PHASE 1:  Determine the currently active neurons.
+        # PHASE 1:  Make predictions based on the previous timestep.
         ########################################################################
-        # Flatten the input column indecies
-        columns = np.ravel_multi_index(column_activations, self.column_dimensions)
+        basal_predictions = self.basal.compute(input_sdr=context_sdr)
+        predictions       = basal_predictions
+
+        if self.apical is not None:
+            apical_predictions = self.apical.compute(input_sdr=apical_sdr)
+            predictions        = np.logical_or(predictions, apical_predictions)
+
+        # Inhibition cancels out predictions.  The technical term is
+        # hyper-polarization.  Practically speaking, this is needed so that
+        # inhibiting neurons can cause mini-columns to burst.
+        if self.inhibition is not None:
+            inhibited   = self.inhibition.compute(input_sdr=inhibition_sdr)
+            predictions = np.logical_and(predictions, np.logical_not(inhibited))
+
+        ########################################################################
+        # PHASE 2:  Determine the currently active neurons.
+        ########################################################################
+        self.columns.assign(column_sdr)
+        columns = self.columns.flat_index
 
         # Activate all neurons which are in a predictive state and in an active
-        # column.
-        active_dense      = self.predictions[columns]
+        # column, unless they are inhibited by apical input.
+        active_dense      = predictions[columns]
         col_num, neur_idx = np.nonzero(active_dense)
         # This gets the actual column index, undoes the effect of discarding the
         # inactive columns before the nonzero operation.  
-        col_idx = columns[col_num]
-        active  = (col_idx, neur_idx)
+        col_idx           = columns[col_num]
+        predicted_active  = (col_idx, neur_idx)
 
         # If a column activates but was not predicted by any neuron segment,
         # then it bursts.  The bursting columns are the unpredicted columns.
@@ -1987,286 +738,670 @@ class TemporalMemory:
         burst_col_idx  = np.repeat(bursting_columns, self.cells_per_column)
         burst_neur_idx = np.tile(np.arange(self.cells_per_column), len(bursting_columns))
         burst_active   = (burst_col_idx, burst_neur_idx)
-        active         = np.concatenate([active, burst_active], axis=1)
+        # Apply inhibition to the bursting mini-columns.
+        if self.inhibition is not None:
+            uninhibited_mask = np.logical_not(inhibited[burst_active])
+            burst_active     = np.compress(uninhibited_mask, burst_active, axis=1)
 
-        # Anomaly metric
-        self.anomaly = len(bursting_columns)/len(columns)
-        a = self.anomaly_alpha
-        self.mean_anomaly = (1-a)*self.mean_anomaly + a*self.anomaly
+        # TODO: Combined apical and basal predictions can cause L5 cells to
+        # spontaneously activate.
+        if False:
+            volunteers = np.logical_and(self.basal_predictions, self.apical_predictions)
+            volunteers = np.nonzero(volunteers.ravel())
+            unique1d(volunteers, predicted_active+burst_active)
 
-        ########################################################################
-        # PHASE 2:  Learn about the previous to current timestep transition.
-        ########################################################################
+        self.active.index = tuple(np.concatenate([predicted_active, burst_active], axis=1))
 
-        # All segments which meet the learning threshold will learn.
-        learning_segments = self.excitement > self.args.learning_threshold
+        # Anomally metric.
+        self.anomaly      = np.array(burst_active).shape[1] / len(self.active)
+        alpha             = self.anomaly_alpha
+        self.mean_anomaly = (1-alpha)*self.mean_anomaly + alpha*self.anomaly
 
-        # All mispredicted segments receive a small permanence penalty (active
-        # segments in inactive columns)
-        inactive_columns = np.ones(self.num_columns, dtype=np.bool)
-        inactive_columns[columns] = False
-        mispredictions = learning_segments[inactive_columns]
-        # misprediction_index = np.ravel_multi_index(np.nonzero(mispredictions),
-        #     (len(inactive_columns), self.cells_per_column, self.segments_per_cell))
-        self.permanences[inactive_columns][mispredictions] -= self.args.mispredict_dec
-
-        # Reinforce all segments which correctly predicted an active column.  
-        col_num, neur_idx, seg_idx = np.nonzero(learning_segments[columns])
-        col_idx   = columns[col_num]
-        reinforce = (col_idx, neur_idx, seg_idx)
-
-        if len(bursting_columns):
-            # The most excited segment in each bursting column should learn to
-            # recognise & predict this state.  First slice out just the bursting
-            # columns.  Then flatten the neurons and segments together into 1
-            # dimension for argmax to work with.
-            bursting_excitement = self.excitement[bursting_columns]
-            bursting_excitement = bursting_excitement.reshape(len(bursting_columns), -1)
-            bursting_flat_idx   = np.argmax(bursting_excitement, axis=1)
-            # Then unflatten the indecies to shape (neuron-index, segment-index)
-            bursting_neurons, bursting_segments = np.unravel_index(bursting_flat_idx, 
-                                (self.cells_per_column, self.segments_per_cell))
-            # Append most excited segments in bursting columns to the reinforce list.
-            reinforce_segments = (bursting_columns, bursting_neurons, bursting_segments)
-            reinforce = np.concatenate([reinforce, reinforce_segments], axis=1)
-
-        # Do this before adding any synapses
-        self.learn_outputs(reinforce)
-
-        if len(bursting_columns):
-            # Add synapses to the potential pool from a random subset of
-            # the previous timesteps activity to the bursting segments.
-            self.make_synapses(self.active, reinforce_segments, .25)
-
-        ########################################################################
-        # PHASE 3:  Compute predictions for the next timestep and return.
-        ########################################################################
-
-        # Compute the predictions based on the current timestep.
-        self.excitement = self.compute_excitment( active )
-        self.excitement = self.excitement.reshape(( self.num_columns, 
-                                                    self.cells_per_column, 
-                                                    self.segments_per_cell))
-
-        self.predictions = np.any(self.excitement > self.args.predictive_threshold, axis=2)
-
-        self.active = tuple(active)    # Save this for the next timestep.
-        return self.predictions
-
-    def compute_excitment(self, input_activity):
+    def learn(self):
         """
-        This uses the given presynaptic activity to determine the postsynaptic
-        excitment.
-
-        Returns the excitement as a flattened array.  
-                Reshape to output_dimensions if needed.
+        Learn about the previous to current timestep transition.
         """
-        if isinstance(input_activity, tuple) or input_activity.shape != self.input_dimensions:
-            # It's significantly faster to make sparse inputs dense than to use
-            # np.in1d, especially since this does NOT discard inactive columns.
-            dense = np.zeros(self.input_dimensions, dtype=np.bool)
-            dense[input_activity] = True
-            input_activity = dense
-        assert(input_activity.dtype == np.bool) # Otherwise self.learn->np.choose breaks
-
-        # Gather the inputs, mask out disconnected synapses, and sum for excitements.
-        self.input_activity = input_activity.reshape(-1)
-        excitments = []
-        for out in np.ndindex(self.sources.shape):
-            assert(self.sources[out].dtype == np.int)
-            inputs = np.take(self.input_activity, self.sources[out])
-            self.inputs[out] = inputs
-            connected_inputs = np.logical_and(self.synapses[out], inputs)
-            x = np.sum(connected_inputs)
-            excitments.append(x)
-        return np.array(excitments)
-
-    def learn_outputs(self, output_activity):
-        """
-        Update permanences and then synapses.
-
-        Argument output_activity is index array
-        """
-        for out in zip(*output_activity):
-            if not len(self.inputs[out]):
-                continue    # Segment is empty...
-            updates = np.choose(self.inputs[out], 
-                                np.array([-self.permanence_dec, self.permanence_inc]))
-            updates = np.clip(updates + self.permanences[out], 0.0, 1.0)
-            self.permanences[out] = updates
-            self.synapses[out]    = updates > self.permanence_threshold
-
-    def make_synapses(self, input_set, output_index, percent_connected):
-        """
-        Attempts to add new synapses to the potential pool.
-
-        Argument input_set is index of previously active cells
-        Argument output_index is index of winning segments which need more synapses
-        Argument percent_connected is the maximum fraction of input_set which 
-                is connected to each output in output_set.  The opposite is also
-                true: it is the max fraction of output_set which each input 
-                connected to.
-        """
-        # if not len(input_set) or (len(input_set.shape) > 1 and not len(input_set[0])):
-        #     return
-
-        # Make input sparse
-        if isinstance(input_set, np.ndarray) and input_set.shape == self.input_dimensions:
-            input_set = np.nonzero(input_set)
-
-        # Flatten the input and output sets
-        inp = np.ravel_multi_index(input_set, self.input_dimensions)
-        if not len(inp):
+        if self.reset_state:
+            # Learning on the first timestep after a reset is not useful. The
+            # issue is that waking up after a reset can not be predicted by
+            # short term memory so don't try to.
+            self.reset_state = False
             return
-        # out = np.ravel_multi_index(output_index, self.output_dimensions)
 
-        num_connections = int(round(percent_connected * self.num_inputs))
-        for site in zip(*output_index):
-            # Randomly select inputs which are not already connected to
-            existing_connections = set(self.sources[site])
-            new_sources = []
-            for new_con in range(num_connections):
-                for retry in range(10):    # Don't die friends
-                    source = random.choice(inp)
-                    if source not in existing_connections:
-                        new_sources.append(source)
-                        existing_connections.add(source)
-                        break
-                else:
-                    # Could not find an unconnected input
-                    # print("DEBUG, no unused inputs remaining")
-                    break
-            # Add the new potential synapses
-            self.sources[site]     = np.concatenate([self.sources[site], np.array(new_sources, dtype=np.int)])
-            new_permanences        = np.random.random(len(new_sources))
-            self.permanences[site] = np.concatenate([self.permanences[site], new_permanences])
-            new_synapses           = new_permanences > self.permanence_threshold
-            self.synapses[site]    = np.concatenate([self.synapses[site], new_synapses])
+        # NOTE: This will add synapses to all neurons which are unpredicted and
+        # active, and it does NOT look at the other segments for predictions...
+        # Either modify each dendrites internal predictions array or overhaul
+        # the way synapses are added and managed.  Regardless, these extras
+        # synapses shouldn't hurt...
+        self.basal.learn(active_sdr=self.active)
+        if self.apical is not None:
+            self.apical.learn(active_sdr=self.active)
+        if self.inhibition is not None:
+            self.inhibition.learn(active_sdr=self.active)
 
-    def excitement_histogram(self, diag=True):
-        """
-        FIXME THIS NEEDS TO BE TIME AVERAGED!!!
+    def statistics(self):
+        stats = 'Temporal Memory ' + self.basal.synapses.statistics()
 
-        Note: diag does NOT show the figure! use plt.show()
-        """
-        data = self.excitement
-        hist, bins = np.histogram(data, 
-                        bins=self.basal.num_inputs, 
-                        range=(0, self.basal.num_inputs),
-                        density=True)
-        if diag:
-            import matplotlib.pyplot as plt
-            plt.figure(instance_tag + " Excitement")
-            max_bin = np.max(np.nonzero(hist)) + 2      # Don't show all the trailing zero
-            plt.plot(bins[:max_bin], hist[:max_bin]*100)
-            plt.title("Histogram of Excitement\n"+
-                "Red line is predictive threshold")
-            plt.xlabel("Postsynaptic Excitement")
-            plt.ylabel("Percent of segments")
-            plt.axvline(self.predictive_threshold, color='r')
-            # plt.show()
-        return hist, bins
+        stats += 'Predictive Segments ' + self.basal.statistics()
+        if self.apical is not None:
+            stats += 'Apical Segments ' + self.apical.statistics()
+        if self.inhibition is not None:
+            stats += 'Inhibition Segments ' + self.inhibition.statistics()
+
+        stats += "Mean anomaly %g\n"%self.mean_anomaly
+        stats += 'Activation statistics ' + self.active.statistics()
+
+        return stats
 
 
-class SDRC_Parameters(Parameters):
-    parameters = ['alpha',]
-    def __init__(self, alpha=1/1000):
-        self.alpha = alpha
+"""
+EXPERIMENT:  I want to check that the B.G. output can encode recognizable
+actions.  Use a statistical classifier to correlate the BG output with the motor
+output and then test if the BG+classifier can function.
 
-class SDR_Classifier(SaveLoad):
-    """Maximum Likelyhood classifier for SDRs."""
-    data_extension = '.sdrc'
-    def __init__(self, parameters, input_shape, output_shape, output_type):
-        """
-        Argument parameters must be an instance of SDRC_Parameters.
-        Argument output_type must be one of: 'index', 'bool', 'pdf'
-        """
-        self.args         = parameters
-        self.input_shape  = tuple(input_shape)
-        self.output_shape = tuple(output_shape)
-        self.output_type  = output_type
-        assert(self.output_type in ('index', 'bool', 'pdf'))
-        # Don't initialize to zero, touch every input+output pair once or twice.
-        self.stats = (np.random.random(self.input_shape + self.output_shape) + 1) * self.args.alpha
-        self.age = 0
+My hypothesis is that the striatum does not encode recognisable actions.
+Experiment with creating a thalamus which accepts L5 state (with topology) and
+learns to control L5 via apical control (with topology).  The BG would then
+control whether the thalamus is excitory or inhibitory.
+"""
 
-    def train(self, inp, out):
-        """
-        Argument inp is tuple of index arrays, as output from SP's or TP's compute method
-        inp = (ndarray of input space dim 0 indexes, ndarray of input space dim 1 indexes, ...)
-        """
-        alpha = self.args.alpha
-        self.stats[inp] *= (1-alpha)   # Decay
-        if self.output_type == 'index':
-            try:
-                for out_idx in zip(*out):
-                    self.stats[inp + out_idx] += alpha
-            except TypeError:
-                self.stats[inp + out] += alpha
-
-        if self.output_type == 'bool':
-            self.stats[inp, out] += alpha
-
-        if self.output_type == 'pdf':
-            updates = (out - self.stats[inp]) * alpha
-            self.stats[inp] += updates
-        self.age += 1
-
-    def predict(self, inp):
-        """
-        Argument inputs is ndarray of indexes into the input space.
-        Returns probability of each catagory in output space.
-        """
-        # Colapse inputs to a single dimension
-        pdf = self.stats[inp].reshape(-1, *self.output_shape)
-        if True:
-            # Combine multiple probabilities into single pdf. Product, not
-            # summation, to combine probabilities of independant events. The
-            # problem with this is if a few unexpected bits turn on it
-            # mutliplies the result by zero, and the test dataset is going to
-            # have unexpected things in it.  
-            return np.product(pdf, axis=0, keepdims=False)
-        else:
-            # Use summation B/C it works well.
-            return np.sum(pdf, axis=0, keepdims=False)
-
-    def __str__(self):
-        s = "SDR Classifier alpha %g\n"%self.args.alpha
-        s += "\tInput -> Output shapes are", self.input_shape, '->', self.output_shape
-        return s
-
-
-class RandomOutputClassifier:
+# TODO: Should burst cells actually activate?  It would make them participate
+# in the apical control too, also learning apical control.  Currently the burst
+# cells learn but are NOT put on the active list.  Also the suppressed cells are
+# kept on the active list...
+#
+class StriatumPopulation:
     """
-    This classifier uses the frequency of the trained target outputs to generate
-    random predictions.  It is used to get a baseline  performance to compare
-    against the SDR_Classifier.
+    This class models the D1 and the D2 populations of neurons in the striatum of
+    the basal ganglia.
     """
-    def __init__(self, output_shape):
-        self.output_shape = tuple(output_shape)
-        self.stats = np.zeros(self.output_shape)
-        self.age = 0
+    def __init__(self, basal_ganglia, size):
+        self.args = args = basal_ganglia.args
+        self.size        = size
+        self.synapses    = SynapseManager(
+            input_sdr           = basal_ganglia.inputs,
+            output_sdr          = SDR((size, basal_ganglia.segments_per_cell)),
+            permanence_thresh   = args.permanence_thresh,)
 
-    def train(self, out):
-        """
-        Argument out is tuple of index arrays, SDR encoded value of target output
-                     Or it can be a dense boolean array too.
-        """
-        if True:
-            # Probability density functions
-            self.stats += out / np.sum(out)
-        else:
-            # Index or mask arrays
-            self.stats[out] += 1
-        self.age += 1
+        self.active  = SDR((size,))
 
-    def predict(self):
+    def compute(self):
         """
-        Argument inputs is ndarray of indexes into the input space.
-        Returns probability of each catagory in output space.
+        Computes each neurons excitement.  This saves all the intermediate
+        state which is needed for learning later.
         """
-        return self.stats
-        return np.random.random(self.output_shape) < self.stats / self.age
+        # Determine which segments activated and count them.
+        self.segment_excitement = self.synapses.compute()
+        self.active_segments    = self.segment_excitement >= self.args.predictive_threshold
+        self.excitement         = np.sum(self.active_segments, axis=1)
+        # Break ties randomly.
+        self.excitement         = self.excitement + np.random.uniform(0, .5, size=self.size)
+        return self.excitement
 
-    def __str__(self):
-        return "Random Output Classifier, Output shape is %s"%str(self.output_shape)
+    # TODO: Move this method back to the BG class, it doesn't belong here.  Consider merging this method with the TD_Error method.
+    def imbalance(self, td_error):
+        """
+        The imbalance is the number of additional D1 neurons and fewer D2
+        neurons which should have activated to predict the correct value.
+        This method discards the sign of TD Error and returns the absolute 
+        magnitude of the imbalance.
+        """
+        k = self.args.num_neurons * self.args.sparsity
+        return int(round(abs(td_error) * k / 2))   # Is okay? Guess and check.
+
+    def strengthen(self, td_error):
+        """
+        Strengthen this population.  This chooses imbalance many neurons to
+        learn about the current input pattern, only the most excited
+        inactive neurons are chosen to learn.
+        """
+        imbalance     = self.imbalance(td_error)
+        if imbalance == 0:
+            return
+        actual_active = len(self.active)
+        target_active = actual_active + imbalance
+        burst         = np.argpartition(-self.excitement, (actual_active, target_active))
+        burst         = burst[actual_active : target_active]
+        # All segments on bursting neurons which meet or excede the learning
+        # threshold will learn.
+        learning_segments_dense    = self.segment_excitement[burst] >= self.args.learning_threshold
+        learn_cell_num, learn_segs = np.nonzero(learning_segments_dense)
+        # The following line undoes the effect of selecting bursting neurons
+        # before the nonzero operation.
+        learn_cells = burst[learn_cell_num]
+        self.synapses.learn_outputs(output_sdr     = (learn_cells, learn_segs),
+                                    permanence_inc = self.args.permanence_inc,
+                                    permanence_dec = self.args.permanence_dec,)
+
+        # Add synapses to bursting neuron segments.  Specifically, subthreshold
+        # learning segments should receive more synapses.
+        subthreshold_learning_segs = np.logical_and(
+                                            learning_segments_dense,
+                                            np.logical_not( self.active_segments[burst] ))
+        add_syn_cell_num, add_syn_seg = np.nonzero(subthreshold_learning_segs)
+        add_syn_cell = burst[add_syn_cell_num] # Fix nonzero after removing unwanted data.
+        self.synapses.add_synapses( output_sdr          = (add_syn_cell, add_syn_seg),
+                                    synapses_per_output = self.args.add_synapses,
+                                    maximum_synapses    = self.args.synapses_per_segment)
+
+        # Give bursting neurons with no learning segments more synapses on new
+        # segments.  Pick segments with few existing potential synapses on them,
+        # which should make sure the segments are used to their full potential,
+        # and not clumping too many synapses on too few segments.
+        # TODO: This could count the number of *connected* inputs?
+        need_more_segs = np.sum(subthreshold_learning_segs, axis=1) < 2 # Hardcoded Number!
+        need_more_segs = burst[need_more_segs]
+        if len(need_more_segs):
+            sources    = self.synapses.postsynaptic_sources.reshape(self.synapses.outputs.dimensions)
+            # Sources shape = (cells, segments)
+            syn_counts = np.array([[seg.shape[0] for seg in seg_slice]
+                                        for seg_slice in sources[need_more_segs]])
+            syn_counts = syn_counts + np.random.uniform(0, .5, size=syn_counts.shape)   # break ties randomly
+            new_seg    = np.argmin(syn_counts, axis=1)
+            self.synapses.add_synapses( output_sdr          = (need_more_segs, new_seg),
+                                        synapses_per_output = self.args.initial_segment_size,
+                                        maximum_synapses    = self.args.synapses_per_segment)
+
+    def weaken(self, td_error):
+        """
+        Weaken this population.  This supresses the least excited but
+        still active neurons, penalizing all learning segments on those
+        neurons so they will ignore this input pattern in the future.
+        """
+        imbalance          = self.imbalance(abs(td_error))
+        if imbalance == 0:
+            return
+        # Find which neurons to supress.
+        actual_active      = len(self.active)
+        target_active      = max(0, actual_active - imbalance)
+        active_excitement  = self.excitement[self.active.flat_index]
+        partitioned_active = np.argpartition(-active_excitement, target_active)
+        supress_active_num = partitioned_active[target_active:]
+        allow_active_num   = partitioned_active[:target_active]
+        # The following lines undo the effect of selecting the active neurons
+        # before the argpartition.
+        supress            = self.active.flat_index[supress_active_num]
+        allow              = self.active.flat_index[allow_active_num]
+        # self.active.flat_index = allow
+
+        # Find which segments on the supressed neurons to weaken.
+        learning_segments = self.segment_excitement[supress] >= self.args.learning_threshold
+        learn_cell_num, lean_segs = np.nonzero(learning_segments)
+        # The following line undoes the effect of selecting the supressed
+        # neurons before the nonzero operation.
+        learn_cells = supress[learn_cell_num]
+        self.synapses.learn_outputs(output_sdr     = (learn_cells, lean_segs),
+                                    permanence_inc = -self.args.permanence_dec,
+                                    permanence_dec = 0,)
+
+    def copy(self):
+        """
+        Make a shallow copy of this population so that it can learn, next cycle
+        when the TD Error is known.
+        """
+        cpy          = copy.copy(self)
+        cpy.synapses = self.synapses.copy()
+        cpy.active   = SDR(self.active)
+        return cpy
+
+class BasalGangliaParameters(Parameters):
+    parameters = [
+        'permanence_dec',
+        'permanence_inc',
+        'permanence_thresh',
+        'mispredict_dec',
+        'predictive_threshold',
+        'learning_threshold',
+        'd1d2_ratio',
+        'num_neurons',
+        'apical_segments',
+        'segments_per_cell',
+        'sparsity',
+        'synapses_per_segment',
+        'td_lambda',
+        'future_discount',
+        'apical_segment_excite',
+        'apical_segment_inhibit',
+        'apical_voluntary',
+        'apical_inhibit',
+        'add_synapses',             # How many synapses to add to subthreshold learning segments.
+        'initial_segment_size',     # How many synases to start new segments with.
+    ]
+
+class BasalGanglia:
+    comment = """
+        The Basal Ganglia (B.G.) performs reinforcement learning using the TD-Lambda
+        algorithm.  This section attempts to explain the algorithm.  When B.G.
+        neurons activate they learn, locking onto input patterns, and they compete
+        with other B.G. neurons in much the same way as spatial pooler mini-columns
+        do.  Within the B.G. there are two subtypes of neurons, called D1 and D2.
+        The purpose of D1 neurons is to learn about positive rewards and D2 neurons
+        learn about negative rewards (penalties).  Put together, D1 and D2 neurons
+        form an estimate the expected value (summation) of rewards in the near
+        future as well as a stabile representation of the current reward state.  It
+        is called an estimate but it is also a prediction of the future.  How far
+        into the future neurons concern themselves with is determined by the
+        parameter 'future_discount'.  The expected value is a function of the number
+        of active D1 cells and the number of active D2 cells.
+
+        Every cycle the B.G. makes a new estimate/prediction of the expected value,
+        adds to it any rewards which were received in the time between cycles, and
+        compares it to the old estimate.  The difference between the old and new
+        estimates is called the TD-Error.  A positive TD-Error indicates an
+        unexpected reward while a negative TD-Error indicates an unexpected penalty.
+        Notice that a reward is as good as the expectation of a reward, and that the
+        new estimate is provably more accurate than the old one because the new
+        estimate includes information about actual rewards received.
+
+        D1 neurons only learn when the TD-Error is positive and D2 neurons only
+        learn when the TD-Error is negative, and in both cases the learning rate is
+        proportional to the absolute magnitude of the TD-Error.  In this way D1 and
+        D2 neurons learn to recognise different events given the same inputs.
+        Because B.G. neurons are not representing the current state of anything, but
+        rather a prediction of the future, they do not learn when they activate.
+        Instead they learn for a period of time immediately after each activation.
+        During this learning period B.G. neurons are essentially checking their
+        predictions.  When the TD-Error is non-zero, indicating an unexpected
+        reward, some recently active B.G. neurons will learn to recognise the
+        current input on the assumption that they probably should have seen the
+        reward comming, and the next time this unexpected situtation occurs some of
+        the neurons which learned about it should activate and improve the expected
+        value estimate, ultimately leading to a reduced TD-Error.
+
+        B.G. neurons use eligability traces to keep track of how recently they
+        activated and if they can learn.  Active neurons set their eligability trace
+        to '1' and all traces exponentially decay towards zero.  Each neurons
+        learning rate is multiplied by its eligability trace, which implements the
+        window of time following each activation when a neuron can learn corrections
+        based on the TD-Error signal.  The parameter 'td_lambda' controls how fast
+        traces decay.  TD-Lambda == 0 causes neurons to only learn in the next cycle
+        and TD-Lambda == 1 causes neurons learn forever.  Conceptually, a neurons
+        trace indicates how relevent it is to the current situtation.
+
+        The TD-Error determines how many neurons in each population learn.  If a
+        population should have had more activations, then the most excited sub-
+        threshold neurons burst.  If a population should have had fewer activations,
+        then the least excited active neurons are penalized.
+
+        When either population has too few recent activations to learn about the TD-
+        Error, then additional neurons are choosen to represent it.  These neurons
+        burst and immediately learn.
+
+        Bursting.  If there aren't enough neurons active for the TD-Error to
+        influence then more neurons are chosen to activate and immediately represent
+        the current input.  For example if there are no D2 neurons active (cause its
+        been a good day) but then anything bad happens, then there are no eligable
+        D2 neurons to learn...
+            - Which neurons? the more excited ones are prefered.
+            - When? Under what conditions?
+            - How many?
+
+        Add synapses ... Maybe to only bursting neurons
+            - when & which neurons & which segments
+
+        Mispredict
+        Penalty ... active segments on inactive neurons are weakened?
+
+        Representational Power ... talk about what this does to ensure that all of
+        the available neurons are used in distinctive ways.
+            - Boosing? track activation freq?
+            - This is a measurable output of the B.G., how to test it?
+
+        Finally talk about the output synapses ... IS THE FOLLOWING CORRECT?
+        Adapt apical dendrites.  The Basal Ganglia outputs bias the agent's actions
+        and the BG uses them to maximize its reward.  The given outputs are the L5
+        activity of the previous cycle, which indirectly caused/affected the current
+        inputs, reward, and TD-Error.  Adapt last cycle's active outputs to
+        associate the recent BG activity (which is stored in the elegability traces)
+        with the TD-Error that the output activations yielded. Do this step before
+        incorperating the current BG activity into the traces. This way the output
+        is learning to recognise the BG state at the time when it took action, not
+        after???
+        """
+    def __init__(self, parameters, input_sdr, output_sdr):
+        """
+        Argument input_sdr is an instance of SDR, state of world to determine
+                 expected value from.
+        Argument output_sdr is an instance of SDR, L5 layer activations, these
+                 are biased by the basal ganglia.  Both input_sdr and output_sdr
+                 should be computed in the same cycle.
+        """
+        assert(isinstance(parameters, BasalGangliaParameters))
+        assert(isinstance(input_sdr, SDR))
+        assert(isinstance(output_sdr, SDR))
+        self.args = args        = parameters
+        self.inputs             = input_sdr
+        self.outputs            = output_sdr
+        self.apical_control     = (SDR(output_sdr.dimensions), SDR(output_sdr.dimensions))
+        self.num_neurons        = int(round(args.num_neurons))
+        self.segments_per_cell  = int(round(args.segments_per_cell))
+        self.apical_segments    = int(round(args.apical_segments))
+        num_d1                  = int(round(self.num_neurons * args.d1d2_ratio))
+        num_d2                  = self.num_neurons - num_d1
+        self.d1                 = StriatumPopulation(self, num_d1)
+        self.d2                 = StriatumPopulation(self, num_d2)
+        self.reset()
+
+    def reset(self):
+        # self.d1_traces = np.zeros(self.num_d1, dtype=PERMANENCE)
+        # self.d2_traces = np.zeros(self.num_d2, dtype=PERMANENCE)
+        self.expected_value = None
+        self.td_error       = 0     # Is used for diagnostics.
+        self.apical_control[0].zero()
+        self.apical_control[1].zero()
+        self.d1_inc = 0
+        self.d1_dec = 0
+        self.d2_inc = 0
+        self.d2_dec = 0
+
+    def expected_value_func(self, d1, d2):
+        """
+        Calculate the expected value. Sungur keeps track of each neurons value,
+        which is updated after learning.  I want to take the ratio of active
+        d1/d2 cells because its simpler and I think that assuming that some
+        cells have values other than their binary activations is not going to
+        work. Striatum cells fire under numerous circumstances, theres no way
+        one value is going to work, and averaging many won't help. arctan2(d1,
+        d2) will bring the expected value to the range [0, pi/2] The expected
+        value needs to gel with the rewards, which are not bounded to any
+        particular range or units.  I could rescale the rewards based on what
+        keeps the expected value in a happy range?  I could use a genetic
+        parameter to scale the reward to a range which works.
+
+        fraction = (|D1| - |D2|) / (|D1| + |D2|)        # Range [-1, 1]
+        theta    = fraction * pi/2                      # Range [-pi/2, pi/2]
+        value    = tan(theta) * RewardSensitivity       # Range [-inf, inf]
+        """
+        d1 = len(d1)
+        d2 = len(d2)
+        new_expected_value = (d1 - d2) / (d1 + d2)
+        return new_expected_value
+
+    # TODO: Consider adding boosting, like SP does.  This could help ensure that
+    # all BG neurons are used.
+    def compute(self, reward):
+        """
+        Argument reward ... set to None to disable learning.
+        """
+        # Activate the neurons with the most active segments.
+        d1_excitement = self.d1.compute()
+        d2_excitement = self.d2.compute()
+        segments      = np.concatenate([d1_excitement, d2_excitement])
+        k             = max(1, int(round(self.args.sparsity * self.num_neurons)))
+        active        = np.argpartition(-segments, k)[:k]
+        self.d1.active.flat_index = active[active <  self.d1.size]
+        self.d2.active.flat_index = active[active >= self.d1.size] - self.d1.size
+
+        new_expected_value = self.expected_value_func(self.d1.active, self.d2.active)
+
+        # Learn.
+        if reward is not None and self.expected_value is not None:
+            td_error = (reward + new_expected_value * self.args.future_discount) - self.expected_value
+            self.td_error = td_error        # Is used for diagnostics.
+
+            """
+            EXPERIMENT:  TD-Error = sign(TD-Error) * log(1 + abs(TD-Error))
+            Clean up TD-Error.  Currently TD-Error is a function of the expected
+            values and the reward, all of which can have arbitrary ranges.  TD-
+            Error is then used to modify all of the synapses by an undetermined
+            amount.  I think the safest thing to do is take the logarithm of TD-
+            Error because it almost always in a good range. Conceptually, the
+            logarithm converts TD-Error into the scale that would be needed to
+            represent it, in base e of course.  After this transform, the TD-
+            Error is sensitive to percent changes in the reward/expected value
+            instead of additive/subtractive changes.
+            """
+            # The sign and magitude of the TD-Error determine which population
+            # (D1/D2) learns and how fast.  Only active neurons learn (or
+            # recently active, as recorded in the elegability traces), and
+            # within a learning neuron all segments which meet the
+            # learning_threshold are adapted to recognise the current input.
+            if td_error > 0:
+                self.prev_d1.strengthen(td_error)
+                self.prev_d2.weaken(td_error)
+            elif td_error < 0:
+                self.prev_d2.strengthen(-td_error)
+                self.prev_d1.weaken(-td_error)
+
+            # Apical synapses learn.  Apical synapses are managed by the TM
+            # class, save as attributes the necessary permanence update
+            # information for the TM class to use.
+            inc = self.args.permanence_inc
+            dec = self.args.permanence_dec
+            if td_error > 0:
+                self.d1_inc = inc * abs(td_error)
+                self.d1_dec = dec * abs(td_error)
+                self.d2_inc = - dec * abs(td_error)
+                self.d2_dec = 0
+            else:
+                self.d1_inc = - dec * abs(td_error)
+                self.d1_dec = 0
+                self.d2_inc = inc * abs(td_error)
+                self.d2_dec = dec * abs(td_error)
+
+            # Apical synapse timing:
+            # Cycle 1: Basal Ganglia neurons activate.
+            # Cycle 2: Apical dendrites in the cortex see the new BG activations.
+            #          Basal Ganglia neurons see the cortical activations which
+            #          contain info about the current state of the world as well
+            #          as the current actions.
+            #          Basal Ganglia makes a new value estimate.
+            #          BG uses TD error to adjust the apical synapses such that
+            #          last cycle's activity causes this cycles (positive TD Error case)
+
+        # Save (shallow) copies of the D1 and D2 population objects and other
+        # things which are needed for learning.
+        self.prev_d1                  = self.d1.copy()
+        self.prev_d2                  = self.d2.copy()
+        self.expected_value           = new_expected_value
+
+    def statistics(self):
+        # TODO: The TD-Error is a measure of how well the BG is representing the
+        # expected value, and I should monitor it throughout the training to
+        # show that it decreases with learning.
+        stats = 'Basal Ganglia Statistics\n'
+        stats += 'Avg TD Error %g\n'%self.mean_td_error
+        return stats
+
+
+class CorticalRegionParameters(Parameters):
+    parameters = [
+        'inp_cols',
+        'inp_radii',
+        'out_cols',
+        'out_radii',
+    ]
+
+class CorticalRegion:
+    def __init__(self, cerebrum_parameters, region_parameters,
+        input_sdr,
+        context_sdr,
+        apical_sdr,
+        inhibition_sdr,):
+        """
+        Argument cerebrum_parameters is an instance of CerebrumParameters.
+        Argument region_parameters is an instance of CorticalRegionParameters.
+        Argument input_sdr ... feed forward
+        Argument context_sdr ... all output layers, flat
+        Argument apical_sdr ... from BG D1 cells
+        Argument inhibition_sdr ... from BG D2 cells
+        """
+        assert(isinstance(cerebrum_parameters, CerebrumParameters))
+        assert(isinstance(region_parameters, CorticalRegionParameters))
+        self.cerebrum_parameters = cerebrum_parameters
+        self.region_parameters   = region_parameters
+
+        self.L6_sp = SpatialPooler( cerebrum_parameters.inp_sp,
+                                    input_sdr  = input_sdr,
+                                    column_sdr = SDR(region_parameters.inp_cols),
+                                    radii      = region_parameters.inp_radii,)
+        self.L6_tm = TemporalMemory(cerebrum_parameters.inp_tm,
+                                    column_sdr  = self.L6_sp.columns,
+                                    context_sdr = context_sdr,)
+
+        self.L5_sp = SpatialPooler( cerebrum_parameters.out_sp,
+                                    input_sdr   = self.L6_tm.active,
+                                    column_sdr  = SDR(region_parameters.out_cols),
+                                    radii       = region_parameters.out_radii,)
+        self.L5_tm = TemporalMemory(cerebrum_parameters.out_tm,
+                                    column_sdr     = self.L5_sp.columns,
+                                    apical_sdr     = apical_sdr,
+                                    inhibition_sdr = inhibition_sdr,)
+
+        self.L4_sp = SpatialPooler( cerebrum_parameters.inp_sp,
+                                    input_sdr   = input_sdr,
+                                    column_sdr  = SDR(region_parameters.inp_cols),
+                                    radii       = region_parameters.inp_radii,)
+        self.L4_tm = TemporalMemory(cerebrum_parameters.inp_tm,
+                                    column_sdr  = self.L4_sp.columns,
+                                    context_sdr = context_sdr,)
+
+        self.L23_sp = SpatialPooler( cerebrum_parameters.out_sp,
+                                    input_sdr   = self.L4_tm.active,
+                                    column_sdr  = SDR(region_parameters.out_cols),
+                                    radii       = region_parameters.out_radii,)
+        self.L23_tm = TemporalMemory(cerebrum_parameters.out_tm,
+                                     column_sdr = self.L23_sp.columns)
+
+    def reset(self):
+        self.L6_tm.reset()
+        self.L5_tm.reset()
+        self.L4_tm.reset()
+        self.L23_tm.reset()
+
+    def compute(self):
+        self.L6_sp.compute()
+        self.L6_tm.compute()
+
+        self.L5_sp.compute()
+        self.L5_tm.compute()
+
+        self.L4_sp.compute()
+        self.L4_tm.compute()
+
+        self.L23_sp.compute()
+        self.L23_tm.compute()
+
+    def learn(self, bg):
+        self.L6_sp.learn(column_sdr=np.any(self.L6_tm.active.dense, axis=1))
+        self.L6_tm.learn()
+        self.L5_sp.learn(column_sdr=np.any(self.L5_tm.active.dense, axis=1))
+        self.L5_tm.apical.permanence_inc     = bg.d1_inc
+        self.L5_tm.apical.permanence_dec     = bg.d1_dec
+        self.L5_tm.inhibition.permanence_inc = bg.d2_inc
+        self.L5_tm.inhibition.permanence_dec = bg.d2_dec
+        self.L5_tm.learn()
+        self.L4_sp.learn(column_sdr=np.any(self.L4_tm.active.dense, axis=1))
+        self.L4_tm.learn()
+        self.L23_sp.learn(column_sdr=np.any(self.L23_tm.active.dense, axis=1))
+        self.L23_tm.learn()
+
+    def statistics(self):
+        stats  = ''
+        stats += 'L6 Proximal ' + self.L6_sp.statistics() + '\n'
+        stats += 'L6 Basal '    + self.L6_tm.statistics() + '\n'
+        stats += 'L5 Proximal ' + self.L5_sp.statistics() + '\n'
+        stats += 'L5 Basal '    + self.L5_tm.statistics() + '\n'
+        stats += 'L4 Proximal ' + self.L4_sp.statistics() + '\n'
+        stats += 'L4 Basal '    + self.L4_tm.statistics() + '\n'
+        stats += 'L23 Proximal ' + self.L23_sp.statistics() + '\n'
+        stats += 'L23 Basal '    + self.L23_tm.statistics() + '\n'
+        return stats
+
+
+class CerebrumParameters(Parameters):
+    parameters = [
+        'alpha',
+        'bg',
+        'inp_sp',
+        'inp_tm',
+        'out_sp',
+        'out_tm',
+    ]
+
+# TODO: Move motor controls into the cerebrum.  This isn't important right now
+#       because I have working motor controls in the eye-experiment file.
+class Cerebrum:
+    """
+    """
+    def __init__(self, cerebrum_parameters, region_parameters, input_sdrs):
+        self.cerebrum_parameters = cerebrum_parameters
+        self.region_parameters   = tuple(region_parameters)
+        self.inputs              = tuple(input_sdrs)
+        self.age                 = 0
+        assert(isinstance(cerebrum_parameters, CerebrumParameters))
+        assert(all(isinstance(rgn, CorticalRegionParameters) for rgn in self.region_parameters))
+        assert(len(region_parameters) == len(self.inputs))
+        assert(all(isinstance(inp, SDR) for inp in self.inputs))
+
+        # The size of the cortex needs to be known before it can be constructed.
+        context_size     = 0
+        self.apical_sdrs = []
+        for rgn_args in self.region_parameters:
+            num_cols  = np.product([int(round(dim)) for dim in rgn_args.out_cols])
+            cells_per = int(round(cerebrum_parameters.out_tm.cells_per_column))
+            context_size += num_cols * cells_per * 2
+            L5_dims      = (num_cols * cells_per,)
+            self.apical_sdrs.append((SDR(L5_dims), SDR(L5_dims)))
+        self.L23_activity  = SDR((context_size/2,))
+        self.L5_activity   = SDR((context_size/2,))
+        self.context_sdr   = SDR((context_size,))
+
+        # Construct the Basal Ganglia
+        self.basal_ganglia = BasalGanglia(cerebrum_parameters.bg,
+                                          input_sdr  = self.context_sdr,
+                                          output_sdr = self.L5_activity,)
+
+        # Construct the cortex.
+        self.regions = []
+        for rgn_args, inp, apical in zip(self.region_parameters, input_sdrs, self.apical_sdrs):
+            rgn = CorticalRegion(cerebrum_parameters, rgn_args,
+                                 input_sdr      = inp,
+                                 context_sdr    = self.context_sdr,
+                                 apical_sdr     = self.basal_ganglia.d1.active,
+                                 inhibition_sdr = self.basal_ganglia.d2.active,)
+            self.regions.append(rgn)
+
+        # Construct the motor controls.
+        pass
+
+    def reset(self):
+        self.basal_ganglia.reset()
+        for rgn in self.regions:
+            rgn.reset()
+
+    def compute(self, reward, learn=True):
+        """
+        Runs a single cycle for a whole network of cortical regions.
+        Arguments inputs and regions are parallel lists.
+        Optional Argument apical_input ... dense integer array, shape=output-dimensions
+        Optional argument learn ... default is True.
+        """
+        for rgn in self.regions:
+            rgn.compute()
+
+        self.L5_activity.assign_flat_concatenate(rgn.L5_tm.active for rgn in self.regions)
+        self.L23_activity.assign_flat_concatenate(rgn.L23_tm.active for rgn in self.regions)
+        self.context_sdr.assign_flat_concatenate([self.L5_activity, self.L23_activity])
+
+        if not learn:
+            reward = None
+        self.basal_ganglia.compute(reward)
+
+        if learn:
+            for rgn in self.regions:
+                rgn.learn(self.basal_ganglia)
+
+        # Motor controls.
+        pass
+
+        if learn:
+            self.age += 1
+
+    def statistics(self):
+        stats = ''
+        for idx, rgn in enumerate(self.regions):
+            stats += 'Region {}\n'.format(idx+1)
+            stats += rgn.statistics() + '\n'
+        # stats += self.basal_ganglia.statistics()
+        return stats

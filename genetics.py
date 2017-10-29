@@ -1,6 +1,8 @@
-# Written by David McDougall, 2017
+"""
+Evolutionary algorithms and supporting tools.
 
-# TODO: Module level docstring
+Written by David McDougall, 2017
+"""
 
 import numpy as np
 import random
@@ -8,27 +10,27 @@ import multiprocessing as mp
 import cProfile, pstats, tempfile
 import traceback
 import sys
-import itertools
-import collections
 import time
 import signal
-import re
 import os, os.path
 import pickle
 import copy
+import csv
 
 class Parameters:
     """
     Abstract parent class for genetic material.  Child classes represent
     parameters for a specific type of object.  The purpose of this class is to
-    facilitate a parameter search, for example a genetic algorithm or swarming.
+    facilitate a parameter search, for example an evolutionary algorithm or
+    swarming.
 
     Class attribute parameters is the list of attributes which make up the 
     mutable parameters, all other attributes are ignored by this class and its
     methods.  The type of these attributes must be one of:
         1) Floating point number
         2) Tuple of floating point numbers
-        3) Instance of Parameters or a child class.
+        3) Boolean number
+        4) Instance of Parameters or a child class.
     """
     parameters = []
 
@@ -44,14 +46,13 @@ class Parameters:
             setattr(self, attr, value)
         missing_parameters = [attr for attr in self.parameters if not hasattr(self, attr)]
         if missing_parameters:
-            raise TypeError("GA_Parameter.__init__() missing parameters: %s"%(', '.join(missing_parameters)))
+            raise TypeError("%s.__init__() missing parameters: %s"%(type(self).__name__, ', '.join(missing_parameters)))
 
-    def mutate(self, percent=0.25):
+    def mutate(self, percent):
         """
         Randomly change a single parameter by at most the given percent.
-        Default maximum mutation is 25%
+        This uses an exponential mutation rate: (1 + percent) ^ uniform(-1, 1)
         """
-        # Pick a parameter to mutate and get its value.
         def attr_probability(attr):
             """This assigns all attributes uniform probability of mutation."""
             value = getattr(self, attr)
@@ -62,7 +63,9 @@ class Parameters:
             elif value is None:
                 return 0    # Don't try to mutate attributes which are set to None.
             else:
+                # Floats and Bools
                 return 1
+        # Pick a parameter to mutate and get its value.
         probabilities   = [attr_probability(attr) for attr in self.parameters]
         probabilities   = np.array(probabilities) / np.sum(probabilities)
         param_idx       = np.random.choice(len(self.parameters), p=probabilities)
@@ -70,8 +73,11 @@ class Parameters:
         value           = getattr(self, param)
         if isinstance(value, Parameters):
             value.mutate(percent)
+        elif isinstance(value, bool):
+            setattr(self, param, not value)
         else:
-            modifier = (1 - percent) + 2 * percent * random.random()
+            # modifier = (1 - percent) + 2 * percent * random.random()
+            modifier = (1 + abs(percent)) ** (random.random()*2-1)
             if isinstance(value, tuple):
                 # Mutate a random element of tuple
                 index    = random.randrange(len(value)) # Pick an element to mutate
@@ -91,10 +97,12 @@ class Parameters:
         Overwrites all parameters on this instance with the parents parameters.
         Modifies this class *IN PLACE*
 
-        Parent parameters which are None are not passed down to the child,
+        Parent parameters which are missing are not passed down to the child,
         instead the child is left with its default for that parameter.
         """
-        # TODO: Insert type checks here?
+        types = {type(p).__name__ for p in parents}.union({type(self).__name__}) # Set notation.
+        if len(types) != 1:
+            print("Warning: crossover applied to different types:", types)
         for attr in self.parameters:
             no_value = object()
             values   = [getattr(obj, attr, no_value) for obj in parents]
@@ -129,39 +137,27 @@ class Parameters:
         return accum
 
     def __str__(self):
-        indent    = 2
-        header    = [type(self).__name__]
-        table     = []
-        max_name  = max(len(nm) for nm in self.parameters)
-        for attr in sorted(self.parameters):
-            pad   = max_name - len(attr) + 2
-            value = str(getattr(self, attr, None))
-            if '\n' in value:
-                value = value.replace('\n', '\n'+' '*indent)
-                value = value.split('\n', maxsplit=1)[1]      # Hacks
-                table.append(' '*indent + attr +'\n'+ value)
+        s = 'htm.' + type(self).__name__ + "(\n"
+        indent      = ' '*4
+        attrs       = sorted(self.parameters)
+        values      = [str(getattr(self, attr, None)) for attr in attrs]
+        inner_block = not any('\n' in v for v in values)
+        alignment   = max(len(attr) for attr in attrs)
+        for attr, value in zip(attrs, values):
+            value = value.replace('\n', '\n' + indent)
+            if inner_block:
+                padding = ' '*(alignment - len(attr))
             else:
-                table.append(' '*indent + attr +' '+ '.'*pad +' '+ value)
-        table.sort(key = lambda ln: '\n' in ln)
-        table = '\n'.join(table)
-
-        # Make all of the columns line up.
-        align_to = max(len(entry) for entry in re.findall(r"^.*\.\.\s", table, re.MULTILINE))
-        aligned_table = []
-        for line in table.split('\n'):
-            match = re.match(r"(^.*\.\.\s)", line, re.MULTILINE)
-            if match is not None:
-                extend = align_to - len(match.group())
-                line = line.replace('.. ', '.'*extend + '.. ')
-            aligned_table.append(line)
-        return '\n'.join(header + aligned_table)
+                padding = ''
+            s += indent + attr + padding + ' = ' + value + ',\n'
+        s = s.rstrip('\n') + ")"
+        return s
 
     @classmethod
     def population_statistics(cls, population):
         """
         Finds the population wide minimum, mean, standard-deviation, and
-        maximumn of all parameters.  The special attribute 'fitness' is included
-        if it is present and not None.  
+        maximumn of all parameters.
 
         Argument population is list of instances of Parameters or a child 
                  class.
@@ -178,10 +174,14 @@ class Parameters:
             return table
         attribute_list = cls.parameters
         for attr in attribute_list:
-            data       = [getattr(indv, attr, None) for indv in population]
+            no_value   = object()
+            data       = [getattr(indv, attr, no_value) for indv in population]
+            data       = [v for v in data if v is not no_value]
             data_types = set(type(v) for v in data)
             if int in data_types and float in data_types:
                 data_types.remove(int)  # Integers are not part of the spec but are OK.
+            if len(data) == 0:
+                data_types = [type(None)]   # No data, use data type None.
             if len(data_types) != 1:
                 raise TypeError("Not one data type for attribute '%s', found %s"%(attr, data_types))
             data_type  = data_types.pop()
@@ -206,6 +206,7 @@ class Parameters:
                     np.max(data),)
         return table
 
+    # TODO: Move this method to the Population class?
     @classmethod
     def pprint_population_statistics(cls, population, file=sys.stdout):
         """
@@ -241,59 +242,80 @@ class Parameters:
 
 class Individual(Parameters):
     """
+    Abstract parent class for each member of a population.  Experiments should
+    subclass Individual for their main parameter class.
+
+    This classes initializer should accept no arguments.  Use class variables to
+    store arguments instead; this works because typically all individuals
+    recieve the same arguments, often from the command line.  This makes it
+    possible for the Population and evolutionary algorithm to make new
+    individuals as needed.
+
     This class provides a fitness function and several supporting methods. The
-    fitness function is a weighted sum; its variables are the attributes of
-    this class which are named in fitness_names_and_weights.keys(),
-    fitness_names_and_weights[ attrbute-name ] is the weight which is used.
+    fitness function is a weighted sum; its variables are the attributes of this
+    class which are named in fitness_names_and_weights.keys(),
+    fitness_names_and_weights[ attrbute-name ] is the weight which is used. For
+    example if fitness_names_and_weights = {'accuracy': 1, 'speed': 1/4} then
+    self.fitness() would return (self.accuracy * 1 + self.speed * 1/4)
+
+    Attribute filename is assigned when an individual is saved into a 
+              population, and is not changed if the individual is saved into
+              another population.
     """
     fitness_names_and_weights = {}
 
     @property
     def fitness(self):
         """
-        Returns the weighted sum of fitnesses, ignoring any attributes set to 
-                None.
+        Returns the weighted sum of fitnesses, as specified in 
+                self.fitness_names_and_weights.  If any of the attributes are
+                missing or set to None, this returns -infinity.
         """
-        memo = getattr(self, '_fitness', None)
-        if memo is not None:
-            return memo
-        can_memo = True
         # Calculate the current fitness.
-        fitness = None
+        fitness = 0
         for attr, weight in self.fitness_names_and_weights.items():
             value = getattr(self, attr, None)
-            if value is not None:
-                if fitness is None:
-                    fitness = 0
-                fitness += value * weight
-            else:
-                can_memo = False
-        # Only save it the fitness if more data won't be arriving.
-        if can_memo:
-            self._fitness = fitness
+            if value is None:
+                fitness = float('-inf')
+                break
+            fitness += value * weight
         return fitness
 
-    def clear_fitness(self):
-        for attr in self.fitness_names_and_weights.keys():
-            setattr(self, attr, None)
-        self._fitness = None
-
-    def apply_eval_return(self, fitness_dict):
+    def evaluate(self):
         """
-        Convenience function to take the dictionary which the evaluate function
+        Subclass should use this method to measure the fitness of this set of
+        parameters.
+
+        This method is executed in a subprocess to escape the GIL.
+
+        If this method raises an exception then it is assumed this individual is
+        at fault and 'self' is discarded from the population.  A stack trace is
+        also printed.
+
+        Returns a dictionary which is pickled, sent across the process boundry,
+                and passed to self.apply_evaluate_return(...).  It must contain
+                the keys of fitness_names_and_weights and its values are the
+                fitnesses.  'None' can be used as a placeholder for missing
+                values.
+        """
+        raise TypeError("Abstract Method Called")
+
+    def apply_evaluate_return(self, fitness_dict):
+        """
+        Convenience method to take the dictionary which the evaluate method
         returns and assign it into attributes on this instance.
 
-        Argument fitness_dict must have the same keys as fitness_names_and_weights
-                 does, and its values are the fitnesses.  'None' can be used as
-                 a placeholder for missing values.  
+        Argument fitness_dict must contain the keys of fitness_names_and_weights
+                 and its values are the fitnesses.
         """
         # Check that evaluate_function returned a valid result.
-        if fitness_dict.keys() != self.fitness_names_and_weights.keys():
-            raise TypeError("Evaluate function returned dictionary which has missing/extra keys.")
+        if set(self.fitness_names_and_weights.keys()) - set(fitness_dict.keys()):
+            raise TypeError("Evaluate function returned dictionary which has missing keys.")
         # Put the fitnesses where they belong.
         for attr_name, fitness in fitness_dict.items():
             setattr(self, attr_name, fitness)
 
+    # TODO: Move this method to the Population class?
     @classmethod
     def population_fitness(cls, population):
         """Finds the min/mean/std/max of each component of fitness."""
@@ -312,6 +334,7 @@ class Individual(Parameters):
                     np.max(data),)
         return stats
 
+    # TODO: Move this method to the Population class?
     @classmethod
     def population_statistics(cls, population):
         """
@@ -326,7 +349,6 @@ class Individual(Parameters):
 
     def __str__(self):
         """Combines the parents parameter table with a fitness table."""
-        indent = 2
         param_table = super().__str__()
         entries = [(attr, getattr(self, attr, None)) for attr in self.fitness_names_and_weights.keys()]
         entries.sort(key = lambda attr_value: attr_value[0])
@@ -338,98 +360,195 @@ class Individual(Parameters):
             fitness_table = "Fitness %g"%entries_w_values[0]
         else:
             max_name = max(len(nm) for nm, ft in entries)
-            lines = [' '*indent + 'fitness']
+            lines = ['fitness']
             for attr, value in entries:
                 pad = max_name - len(attr) + 2
-                lines.append('  '*indent + attr +' '+ '.'*pad +' '+ str(value))
+                lines.append('  ' + attr +' '+ '.'*pad +' '+ str(value))
             fitness_table = '\n'.join(lines)
-        return param_table + '\n' + fitness_table
+        return fitness_table + '\n' + param_table
 
 
-# NOTE: This could be made from a batch of jobs into a rolling queue of jobs.  
-#       There would not be distinct generations but it would be easier and
-#       more efficient to distribute jobs across many cores, (less waiting as
-#       the final job completes on the slowest node).  This is something I will
-#       want to do if I ever get a cluster of computers.  
-def genetic_algorithm(parameter_class, evaluate_function,
-    population_size                 = 50,
-    num_epochs                      = 1,
-    seed                            = False,
-    seed_mutations_per_parameter    = 2,
-    seed_mutation_percent           = 0.025,
-    mutation_probability            = 0.10,
-    mutation_percent                = 0.25,
-    filename                        = 'checkpoint',
-    num_processes                   = 7,
+class Population(list):
+    """
+    Manages groups of Individuals.
+
+    All populations exist on file, in the directory:
+    .   [program_name]_data/[population_name]/
+    .       Where program_name is the name of the program (from sys.argv[0]), 
+    .           without its extension.
+    .       Where population_name is an attribute and the first argument to the
+    .           __init__ method.
+    This directory contains a file for each Individual and a scoreboard file.
+    Low performing Individuals are not removed from file, they are instead
+    filtered out by this class.
+
+    Each individuals file is a pickle.  It is named using random characters and
+    its filename is assigned to attribute individual.filename.
+
+    The scoreboard file is a comma separated values file containing the filename
+    and fitnesses of every individual in the population.  It is kept in sorted
+    order.  It is named "scoreboard.csv".  This class maintains attribute
+    "scoreboard" for convenience.
+
+    This class is a subclass of list and it maintains in itself the list of the
+    most fit individuals in the population.  The maximum number of individuals
+    to load is controlled by attribute population_size.
+
+    Attribute population_size is the maximum number of individuals which this
+              population will contain at one time.
+    """
+    def __init__(self, population_name, population_size):
+        """
+        Argument population_name ...
+        Argument population_size is the number of Individuals to use.  If there
+                 are more individuals than this on file then only the most fit
+                 of them are used.  
+        """
+        super().__init__()
+        self.population_name = population_name
+        self.population_size = population_size
+        program, program_ext = os.path.splitext(sys.argv[0])
+        self.path            = os.path.join(program + '_data', self.population_name)
+        # Load the scoreboard file.
+        self.scoreboard_filename = os.path.join(self.path, 'scoreboard.csv')
+        self.scoreboard = []
+        try:
+            with open(self.scoreboard_filename) as sbf:
+                for entry in csv.DictReader(sbf):
+                    entry['fitness'] = float(entry['fitness'])
+                    self.scoreboard.append(entry)
+        except FileNotFoundError:
+            pass
+        # Load the top of the scoreboard.
+        for entry in self.scoreboard:
+            if len(self) >= self.population_size:
+                break
+            file_path = os.path.join(self.path, entry['name'])
+            try:
+                with open(file_path, 'rb') as indv_file:
+                    indv  = pickle.load(indv_file)
+                self.append( indv )
+            except FileNotFoundError:
+                pass
+
+    def generate_filename(self):
+        length = 5
+        taken_names = set(entry['name'] for entry in self.scoreboard)
+        for attempt in range(10):
+            random_tag = ''.join(chr(ord('A') + random.randrange(26)) for _ in range(length))
+            name = random_tag + '.indv'
+            if name not in taken_names:
+                return name
+        raise Exception("Could not generate unique file name.")
+
+    def save(self, indv):
+        """
+        Adds an individual to this population.
+
+        Argument indv is an instance of Individual.  This does NOT check if
+                 the given individual has already been saved, don't save twice.
+        """
+        # Save individual to file
+        if not hasattr(indv, 'filename'):
+            indv.filename = self.generate_filename()
+        file_path         = os.path.join(self.path, indv.filename)
+        os.makedirs(self.path, exist_ok=True)
+        with open(file_path, 'wb') as indv_file:
+            pickle.dump(indv, indv_file)
+        # Update the scoreboard.
+        self.scoreboard.append({'name': indv.filename, 'fitness': indv.fitness})
+        self.scoreboard.sort(reverse=True, key=lambda entry: entry['fitness'])
+        with open(self.scoreboard_filename, 'w') as sbf:
+            writer = csv.DictWriter(sbf, fieldnames=['name', 'fitness'])
+            writer.writeheader()
+            for entry in self.scoreboard:
+                writer.writerow(entry)
+        # Add to internal population
+        self.append(indv)
+        self.sort(reverse=True, key=lambda indv: indv.fitness)
+        while len(self) > self.population_size:
+            self.pop()
+
+    def _average(self):
+        """
+        Returns an individual whos parameters are set to the statistical mean of
+        the population's parameters.
+        """
+        1/0 # unimplemented
+        indv = type(self[0])
+        pop_stats = type(self[0]).population_statistics(self)
+
+
+def evolutionary_algorithm(
+    experiment_class,
+    population,
+    mutation_probability            = 0.20,
+    mutation_percent                = 0.20,
+    num_processes                   = None,
     profile                         = False,):
     """
-    Argument parameter_class ... is called with no arguments and must return an
-             instance of Individual.
+    Argument experiment_class ... initializer is given no arguments.
+    Argument population ...
 
-    Argument evaluate_function is called with an instance of the parameter_class
-             and must return a dict whos names are fitness_names_and_weights.keys()
-             and their values or None placeholders.  
-             If evaluate_function raises a ValueError then this function will
-             assume the indivual's parameters are at fault and discards them
-             from the population by setting their fitness to negative infinity.
-
-    Note: All extra arguments to parameter_class and evaluate_function must be
-          applied before they are given to this function.  See functools.partial.
-
-    Argument population_size ...
-    Argument num_epochs ...
     Argument mutation_probability ...
     Argument mutation_percent ...
 
-    Argument seed ...
-    Argument seed_mutations_per_parameter ...
-    Argument seed_mutation_percent is the amount to mutate the seeds by.
-
-    Argument filename is passed to checkpoint() to save the results.
-    Argument num_processes ...
+    Argument num_processes ... defaults to the number of CPU cores present.
     Argument profile ...
     """
-    population    = []
-    generation    = 0
-    profile_stats = []
-    if seed:
-        # Make the initial population
-        print("SEEDING WITH %d"%population_size)
-        for _ in range(population_size):
-            indv = parameter_class()
-            for mut in range(int(round(seed_mutations_per_parameter * len(indv)))):
-                indv.mutate(seed_mutation_percent)
-            population.append(indv)
-    # Run the Genetic Algorithm
+    if num_processes is None:
+        num_processes = os.cpu_count()
+    worker_pool       = mp.Pool(num_processes, maxtasksperchild=1)
+    profile_stats     = []
+    evals_done        = 0
+
+    # The following two functions call each other to keep the process pool full
+    # at all times.
+    def start_worker_subproc():
+        # Start with a blank individual, default parameters.
+        indv = experiment_class()
+        # Crossover and mutate.
+        if len(population):
+            indv.crossover(random.sample(population, min(2, len(population))))
+        if random.random() < mutation_probability:
+            indv.mutate(mutation_percent)
+        # Start evaluating the individual.  The process pool will call the
+        # callback (end_worker_subproc) with the results when it's done.
+        subproc_arguments = (indv, profile)
+        worker_pool.apply_async(_ea_subproc_main, subproc_arguments,
+                                callback = end_worker_subproc)
+
+    def end_worker_subproc(results):
+        # Unpack the results of the evaluation.
+        if profile:
+            indv, fitness, pr_file = results
+            profile_stats.append(pr_file)
+        else:
+            indv, fitness = results
+        # Only save it to file if it did not crash.
+        if fitness is not None:
+            indv.apply_evaluate_return(fitness)
+            population.save(indv)
+        # Queue the next job.
+        start_worker_subproc()
+        # Book keeping
+        nonlocal evals_done
+        evals_done += 1
+
     try:
-        for epoch in range(num_epochs):
-            population, generation = checkpoint(population, generation, filename)
-            print("CHECKPOINT %d, POP SZ %d, %s"%(generation, len(population), filename))
-            # Generate new parameters and new combinations of parameters.
-            for _ in range(population_size):
-                chd = parameter_class()
-                chd.crossover(random.sample(population, min(2, len(population))))
-                if random.random() < mutation_probability:
-                    chd.mutate(mutation_percent)
-                population.append(chd)
-            # Evaluate each individual
-            eval_list = [indv for indv in population if indv.fitness is None]
-            eval_args = [(indv, evaluate_function, profile) for indv in eval_list]
-            with mp.Pool(num_processes) as procpool:
-                results = procpool.starmap(_genetic_algorithm_evaluate, eval_args)
-            # Unpack with the results of the evaluations.
-            if profile:
-                fitness_list, profiles = zip(*results)
-                profile_stats.extend(profiles)
-            else:
-                fitness_list = results
-            for indv, fit_dict in zip(eval_list, fitness_list):
-                indv.apply_eval_return(fit_dict)
-            # Cull the population down to size.
-            population.sort(key=lambda indv: indv.fitness, reverse=True)
-            population = population[:population_size]
-            generation += 1
-            print("Mean fitness %g"%(sum(indv.fitness for indv in population)/len(population)))
+        # Kick off the evolutionary algorithm.
+        for task in range(num_processes):
+            start_worker_subproc()
+
+        # Run until interrupted.
+        prev_print = 0
+        while True:
+            if prev_print != evals_done:
+                if evals_done % population.population_size == 0:
+                    mean_fitness = sum(indv.fitness for indv in population) / len(population)
+                    print("Mean fitness %g"%(mean_fitness))
+                    prev_print = evals_done
+            time.sleep(30)
     finally:
         if profile:
             # Assemble each evaluation's profile into one big profile and print it.
@@ -437,154 +556,59 @@ def genetic_algorithm(parameter_class, evaluate_function,
             stats.sort_stats('time')
             stats.print_stats()
             for tempfile in profile_stats:
-                os.remove(tempfile)     # Clean up
+                os.remove(tempfile)     # Clean up.
 
-    population, generation = checkpoint(population, generation, filename)
-    print("SUMMARY FOR GENERATION %d, %s"%(generation, filename))
-    parameter_class.pprint_population_statistics(population)
-    print()
-    for indv in population[:5]:
-        print(str(indv))
-        print()
-    return population, generation
-
-def _genetic_algorithm_evaluate(individual, evaluate_function, profile):
+def _ea_subproc_main(individual, profile):
     """
     This function is executed in a subprocess.
 
-    Argument profile ... is boolean, causes this to return tuple of (fitness,
-             stats_file) where stats_file is a temporary file containing the
-             binary pstats.Stats() output of the profiler.
+    If individual.evaluate() raises a ValueError then its fitness is replaced
+    with None, caller should discard this individual.
+
+    Argument profile ... is boolean, causes this to return the path to a 
+             stats_file which is a temporary file containing the binary
+             pstats.Stats() output of the profiler.
+
+    Returns either (individual, fitness)
+            or     (individual, fitness, profile_stats_filename)
     """
     if profile:
         pr = cProfile.Profile()
         pr.enable()
     try:
-        fitness = evaluate_function(individual)
-    except ValueError:
+        indv_inst_copy = copy.deepcopy(individual)
+        fitness = indv_inst_copy.evaluate()
+    except Exception:
+        # This exception handler works because the process pool ends its
+        # processes after every job and makes a new clean process for the next
+        # job.
         print(str(individual))
         traceback.print_exc()
-        fitness = float('-inf')
-    finally:
-        signal.alarm(0)     # Cancels any timer which class speed_fitness set.
+        fitness = None
     if profile:
         pr.disable()
         stats_file = tempfile.NamedTemporaryFile(delete=False)
         pr.dump_stats(stats_file.name)
-        return fitness, stats_file.name
+        return individual, fitness, stats_file.name
     else:
-        return fitness
+        return individual, fitness
 
 
-def checkpoint(population, generation, filename='checkpoint'):
+def memory_fitness(threshold=2e9, maximum=3e9):
     """
-    Saves/Loads the population from file.
-
-    Folder is name of program + "_data/".
-    Filename is "checkpoint.[GENERATION].pop"
-
-    If the population is empty and there is a checkpoint on file then the
-    latest checkpoint is returned as a pair of (population, generation).
-    Otherwise this returns the given (population, generation).
-    """
-    program, ext  = os.path.splitext(sys.argv[0])
-    path, program = os.path.split(program)
-    folder        = os.path.join(path, program + '_data')
-
-    def save(pop, gen, filename):
-        filename_ext = filename + '.' + str(gen) + '.pop'
-        full_filename = os.path.join(folder, filename_ext)
-        try:
-            os.makedirs(folder)
-        except OSError:
-            pass
-        pickle.dump(pop, open(full_filename, 'wb'))
-
-    def max_gen(filename):
-        """Returns pair of (filename, generation)"""
-        matches = []
-        for fn in os.listdir(folder):
-            fn_format = r'^' + filename + r'\.(\d+)\.pop$'
-            m = re.match(fn_format, fn)
-            if m:
-                gen = int(m.groups()[0])
-                fn  = os.path.join(folder, fn)
-                matches.append((fn, gen))
-        try:
-            return max(matches, key=lambda p: p[1])
-        except ValueError:
-            return None, -1
-
-    if len(population):
-        save(population, generation, filename)
-        return population, generation
-    else:
-        filename, latest_gen = max_gen(filename)
-        if filename is not None and latest_gen >= 0:
-            return pickle.load(open(filename, 'rb')), latest_gen
-        else:
-            return population, generation
-
-
-def _total_size(o, handlers={}, verbose=False):
-    """
-    Returns the approximate memory footprint an object and all of its contents.
-
-    Automatically finds the contents of the following builtin containers and
-    their subclasses:  tuple, list, deque, dict, set and frozenset.
-    To search other containers, add handlers to iterate over their contents:
-
-        handlers = {SomeContainerClass: iter,
-                    OtherContainerClass: OtherContainerClass.get_elements}
-
-    If none of the handlers match, then this attempts to crawls obj.__dict__.
-    """
-    dict_handler = lambda d: itertools.chain.from_iterable(d.items())
-    all_handlers = {tuple: iter,
-                    list: iter,
-                    collections.deque: iter,
-                    dict: dict_handler,
-                    set: iter,
-                    frozenset: iter,
-                   }
-    all_handlers.update(handlers)     # user handlers take precedence
-    seen = set()                      # track which object id's have already been seen
-    default_size = sys.getsizeof(0)   # estimate size of object without __sizeof__
-
-    def sizeof(o):
-        if id(o) in seen:       # do not double count the same object
-            return 0
-        seen.add(id(o))
-        s = sys.getsizeof(o, default_size)
-
-        if verbose:
-            print(s, type(o), repr(o), file=sys.stderr)
-
-        for typ, handler in all_handlers.items():
-            if isinstance(o, typ):
-                s += sum(map(sizeof, handler(o)))
-                break
-        else:
-            if hasattr(o, '__dict__'):
-                attr = [val for name, val in o.__dict__.items() if not name.startswith('_')]
-                s += sum(map(sizeof, attr))
-        return s
-
-    return sizeof(o)
-
-
-def memory_fitness(instance, threshold=0.8e9, maximum=1.2e9):
-    """
-    Returns a penalty for using too much memory.  Add this to your fitness 
-    function.
+    Returns a penalty for using too much memory.  Add this to your fitness
+    function.  This measures the current processes maximum resident set (maxrss)
+    which is the all time peak memory usage for the calling process.
 
     Argument threshold is where the this penalty begins.
-    Argument maximum is where this penalty becomes an error.
+    Argument maximum is where this penalty becomes an error (ValueError).
 
     Returns in the range [0, 1] where 0 is no penalty and 1 is the maximum
             memory usage.  Linear ramp from threshold to maximum.
     """
-    size = _total_size(instance)
+    import resource
+    rsc = resource.getrusage(resource.RUSAGE_SELF)
+    size = rsc.ru_maxrss * 1024
     fit  = (size - threshold) / (maximum - threshold)
     if fit > 1:
         raise ValueError("Individual exceded memory limit (size %d bytes, maximum %d)."%(size, maximum))
@@ -600,8 +624,8 @@ class speed_fitness:
     """
     def __init__(self, threshold, maximum):
         """
-        Argument threshold, maximum units are minutes.
-                 Raises a ValueError if the maximum time limit is exceded.
+        Arguments threshold, maximum ... units are minutes.
+                  Raises a ValueError if the maximum time limit is exceded.
         """
         assert(signal.alarm(0) == 0) # Check that no alarm was already set.
         self.threshold   = threshold
@@ -611,7 +635,7 @@ class speed_fitness:
         signal.alarm(int(round(maximum * 60)))
 
     def handler(self, signum, frame):
-        raise ValueError("Individual exceded time limit.")
+        raise ValueError("Individual exceded time limit (%d minutes)."%self.maximum)
 
     def done(self):
         """

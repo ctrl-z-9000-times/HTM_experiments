@@ -120,52 +120,59 @@ def synthesize(seed, diag=False):
     return synth
 
 
-class MNIST_Parameters(genetics.Individual):
-    parameters = ['sp', 'sdrc',]
+class MNIST_Experiment(genetics.Individual):
+    parameters = ['sp', 'cols', 'radii', 'sdrc', 'proximal_segments']
     fitness_names_and_weights = {'score': 1,}
     train_time = 1/2
     def __init__(self,):
         self.sp = SpatialPoolerParameters(
-            column_dimensions   = (1.216e+02, 1.274e+02),
-            radii               = (3.308e+00, 1.933e+00),
             potential_pool      = 1.173e+02,
             sparsity            = 1.047e-02,
-            coincidence_inc     = 3.532e-02,
-            coincidence_dec     = 1.069e-02,
+            permanence_inc      = 3.532e-02,
+            permanence_dec      = 1.069e-02,
             permanence_thresh   = 3.901e-01,
             boosting_alpha      = 7.503e-04,
         )
-        self.sdrc = SDRC_Parameters(alpha=1.129e-03)
+        self.cols       = (1.216e+02, 1.274e+02)
+        self.radii      = (3.308e+00, 1.933e+00)
+        self.sdrc       = SDRC_Parameters(alpha=1.129e-03)
+        self.proximal_segments = 5
 
+    def evaluate(self):
+        # Load data, Setup spatial pooler machine.
+        train_labels, train_images, test_labels, test_images = load_mnist()
+        training_data = list(zip(train_images, train_labels))
+        test_data     = list(zip(test_images, test_labels))
+        enc           = BWImageEncoder(train_images[0].shape[:2], diag=False)
+        self.machine  = machine = SpatialPooler(self.sp,
+                                      input_sdr   = enc.output,
+                                      column_sdr  = SDR(self.cols),
+                                      radii       = self.radii,
+                                      multisegment_experiment = self.proximal_segments)
+        class_shape   = (10,)
+        sdrc          = SDR_Classifier(self.sdrc, machine.columns.dimensions, class_shape, 'index')
 
-def evaluate(parameters):
-    # Load data, Setup spatial pooler machine.
-    train_labels, train_images, test_labels, test_images = load_mnist()
-    training_data = list(zip(train_images, train_labels))
-    test_data     = list(zip(test_images, test_labels))
-    enc           = BWImageEncoder(train_images[0].shape[:2], diag=False)
-    machine       = SpatialPooler(parameters.sp, enc.output_shape)
-    class_shape   = (10,)
-    sdrc          = SDR_Classifier(parameters.sdrc, machine.column_dimensions, class_shape, 'index')
+        # Training Loop
+        train_cycles = len(train_images) * self.train_time
+        for i in range(int(round(train_cycles))):
+            img, lbl      = random.choice(training_data)
+            img           = synthesize(img, diag=False)
+            enc.encode(np.squeeze(img))
+            machine.compute()
+            machine.learn()
+            state = machine.columns.index
+            sdrc.train(state, (lbl,))
 
-    # Training Loop
-    train_cycles = len(train_images) * parameters.train_time
-    for i in range(int(round(train_cycles))):
-        img, lbl      = random.choice(training_data)
-        img           = synthesize(img, diag=False)
-        img_enc       = enc.encode(np.squeeze(img))
-        state         = machine.compute(img_enc)
-        sdrc.train(state, (lbl,))
-
-    # Testing Loop
-    score = 0
-    for img, lbl in test_data:
-        img_enc     = np.squeeze(enc.encode(img))
-        state       = machine.compute(img_enc, learn=False)
-        prediction  = np.argmax(sdrc.predict(state))
-        if prediction == lbl:
-            score   += 1
-    return {'score': score / len(test_data)}
+        # Testing Loop
+        score = 0
+        for img, lbl in test_data:
+            enc.encode(np.squeeze(img))
+            machine.compute()
+            state = machine.columns.index
+            prediction  = np.argmax(sdrc.predict(state))
+            if prediction == lbl:
+                score   += 1
+        return {'score': score / len(test_data)}
 
 
 if False:
@@ -212,7 +219,7 @@ if False:
         # Show a table of SP inputs & outputs
         examples = 4    # This many rows of examples, one example per row
         cols = 6        # This many columns
-        plt.figure(instance_tag + ' examples')
+        plt.figure('Examples')
         for row in range(examples):
             for sub_col in range(int(cols / 2)):
                 img, lbl = random.choice(test_data)
@@ -235,40 +242,33 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-n', '--processes',  type=int, default=7, 
-        help="Number of processes to use.")
+                        help="Number of processes to use.")
     parser.add_argument('-t', '--time',       type=float, default=1/2,
-        help='Number of times to run through the training data.')
+                        help='Number of times to run through the training data.')
     parser.add_argument('-p', '--population', type=int, default=50)
-    parser.add_argument('-e', '--epochs',     type=int, default=1)
-    parser.add_argument('--seed',             action='store_true',
-        help='Starts a new population and ignore any saved checkpoints, '+
-             'Otherwise this loads the latest checkpoint from file.')
+    parser.add_argument('--mutate',           action='store_true',
+                        help='More mutations.')
     parser.add_argument('--checkpoint',  type=str,  default='checkpoint',
-        help='What name to save the results by.')
+                        help='What name to save the results by.')
     parser.add_argument('--default_parameters',  action='store_true', 
-        help='Evaluate just the default parameters.')
+                        help='Evaluate just the default parameters.')
     args = parser.parse_args()
 
-    MNIST_Parameters.train_time = args.time
+    MNIST_Experiment.train_time = args.time
 
     if args.default_parameters:
-        default = MNIST_Parameters()
+        default = MNIST_Experiment()
         print(default)
         print()
-        print('Evaluate returned', evaluate(default))
+        print('Evaluate returned', default.evaluate())
+        print(default.machine.statistics())
     else:
-        genetics.genetic_algorithm(
-            MNIST_Parameters,
-            evaluate,
-            population_size                 = args.population,
-            num_epochs                      = args.epochs,
-            seed                            = args.seed,
-            seed_mutations_per_parameter    = 20,
-            seed_mutation_percent           = 0.05,
-            mutation_probability            = 0.20,
-            mutation_percent                = 0.10,
-            filename                        = args.checkpoint,
+        population = genetics.Population(args.checkpoint, args.population)
+        genetics.evolutionary_algorithm(
+            MNIST_Experiment,
+            population,
+            mutation_probability            = 0.50 if args.mutate else 0.25,
+            mutation_percent                = 0.50 if args.mutate else 0.25,
             num_processes                   = args.processes,
             profile                         = True,
         )
-        exit(0)

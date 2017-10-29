@@ -10,7 +10,6 @@ Written by David McDougall, 2017.
 TODO
 - Install datasets repository, place link to it in this directory...
 - `./setup.py build_ext --inplace`
-- Needs requirements file
 
 ## MNIST Experiment Notes:
 
@@ -109,6 +108,17 @@ seperable is a mathematical property which in short, makes gaussian filters very
 fast to compute.  Normal distributions are unique in having both of these
 properties.
 
+## Reinforcement Learning Notes:
+
+Many thanks to:  
+Sungur, 2017.  "HIERARCHICAL TEMPORAL MEMORY BASED AUTONOMOUS AGENT FOR
+PARTIALLY OBSERVABLE VIDEO GAME ENVIRONMENTS"
+
+TODO: explain all of the ways in which my system is different from Sungur's
+system.
+
+
+
 ## Cython Notes:
 
 The htm module is written in Cython, a superset of python3 which is compiled
@@ -128,4 +138,4 @@ Profiling shows that notifying each output about which inputs also activated
 is the one of the more time consuming steps.  To facilitate this step, this
 class keeps an extra index table containing which outputs are connected to by
 each input. Using this optimization, synapses are only visited if their
-presynaptic input is active and it the synapse is in a connected state.
+presynaptic input is active and if the synapse is in a connected state.
