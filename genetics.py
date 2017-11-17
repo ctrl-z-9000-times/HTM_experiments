@@ -39,6 +39,13 @@ class Parameters:
         Child classes override this as needed.  This writes all keyword
         arguments into the new instance as its initial values.
         """
+        # This allows child classes to pass their locals() as **kw_args, which
+        # is useful for mixing default parameters and **kw_args.   Double
+        # underscores are magic and come and go as they please.  Filter them all
+        # out.
+        dunder  = lambda name: name.startswith('__') and name.endswith('__')
+        kw_args = {k:v for k,v in kw_args.items() if not dunder(k)}
+
         p_set = set(self.parameters)
         for attr, value in kw_args.items():
             if attr not in p_set:
@@ -223,7 +230,8 @@ class Parameters:
         # Push fitness to either the top of the bottom of the table and then
         # sort alphabetically.
         entries.sort(key = lambda entry: (entry[0].count('fitness'), entry[0]))
-        lines      = ["Population Statistics for %d %s"%(len(population), cls.__name__)]
+        lines      = ["Population Statistics for %d %s (%d total)"%(
+                    len(population), cls.__name__, len(population.scoreboard))]
         max_name   = max(len(nm) for nm in table.keys()) + 2
         name = 'Parameter'
         lines.append(name+' '+' '*(max_name - len(name))+' Min       | Mean      | Std       | Max')
@@ -274,6 +282,8 @@ class Individual(Parameters):
         # Calculate the current fitness.
         fitness = 0
         for attr, weight in self.fitness_names_and_weights.items():
+            if weight == 0:
+                continue
             value = getattr(self, attr, None)
             if value is None:
                 fitness = float('-inf')
@@ -539,6 +549,9 @@ def evolutionary_algorithm(
         # Kick off the evolutionary algorithm.
         for task in range(num_processes):
             start_worker_subproc()
+            # Stagger the start-ups, which take lots of temporary memory.
+            for second in range(60):
+                time.sleep(1)   # Main thread remains responsive to subprocess communications.
 
         # Run until interrupted.
         prev_print = 0
@@ -548,7 +561,8 @@ def evolutionary_algorithm(
                     mean_fitness = sum(indv.fitness for indv in population) / len(population)
                     print("Mean fitness %g"%(mean_fitness))
                     prev_print = evals_done
-            time.sleep(30)
+            for second in range(30):
+                time.sleep(1)   # Main thread remains responsive to subprocess communications.
     finally:
         if profile:
             # Assemble each evaluation's profile into one big profile and print it.
@@ -621,6 +635,9 @@ class speed_fitness:
     1.  timer = speed_fitness(45 minutes, 90 minutes)
     2.  Do_work_which_may_take_a_long_time( instance_of_individual )
     3.  return { 'speed_fitness': timer.done() }
+    Alternatively:
+    3.  return { 'speed_fitness': timer.elapsed_time }
+    4.  IndividualClass.fitness_names_and_weights['speed_fitness'] = 0
     """
     def __init__(self, threshold, maximum):
         """
@@ -643,6 +660,10 @@ class speed_fitness:
         sub-threshold and 1 is the maximum allowable time.
         """
         signal.alarm(0)          # Disable the alarm
-        self.elapsed_time = (time.time() - self.start_time) / 60
         return max(0, (self.elapsed_time - self.threshold) / (self.maximum - self.threshold))
+
+    @property
+    def elapsed_time(self):
+        """Minutes since this objects instantiation."""
+        return (time.time() - self.start_time) / 60
 

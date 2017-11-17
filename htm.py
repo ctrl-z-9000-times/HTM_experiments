@@ -11,7 +11,8 @@ import copy
 from genetics import Parameters
 from encoders import *
 from classifiers import *
-from sdr import SDR, SynapseManager
+# from basal_ganglia import *
+from sdr import SDR, SynapseManager, Dendrite
 
 
 class SpatialPoolerParameters(Parameters):
@@ -77,9 +78,7 @@ class SpatialPooler:
     a gaussian window and the standard deviation of it is proportional to the
     deviation which is used to make the receptive fields of each column.
     Columns inhibit each other in proportion to the number of inputs which they
-    share.
-
-    In pseudo code:
+    share.  In pseudo code:
     1.  mean_normalized = excitement - gaussian_blur( excitement, radius )
     2.  standard_deviation = sqrt( gaussian_blur( mean_normalized ^ 2, radius ))
     3.  normalized = mean_normalized / standard_deviation
@@ -126,10 +125,12 @@ class SpatialPooler:
             self.segments_per_cell = int(round(multisegment_experiment))
             self.proximal = SynapseManager( self.inputs,
                                             SDR(self.columns.dimensions + (self.segments_per_cell,),
-                                                activation_frequency_alpha=args.boosting_alpha),    # DEBUG
+                                                activation_frequency_alpha=args.boosting_alpha),    # Used for boosting!
                                             permanence_inc    = args.permanence_inc,
                                             permanence_dec    = args.permanence_dec,
                                             permanence_thresh = args.permanence_thresh,)
+            # Initialize to the target activation frequency/sparsity.
+            self.proximal.outputs.activation_frequency.fill(args.sparsity / self.segments_per_cell)
         else:
             self.proximal = SynapseManager( self.inputs,
                                             self.columns,
@@ -158,19 +159,27 @@ class SpatialPooler:
         args = self.args
         if self.multisegment:
             # EXPERIMENT: Multi segment proximal dendrites.
-            raw_excitment = self.proximal.compute(input_sdr=input_sdr)
-            self.segment_excitement = raw_excitment
+            excitment = self.proximal.compute(input_sdr=input_sdr)
+
+            # Logarithmic Boosting Function.
+            if args.boosting_alpha is not None:
+                target_sparsity = args.sparsity / self.segments_per_cell
+                boost = np.log2(self.proximal.outputs.activation_frequency) / np.log2(target_sparsity)
+                boost = np.nan_to_num(boost).reshape(self.proximal.outputs.dimensions)
+                excitment = boost * excitment
+
+            self.segment_excitement = excitment
             # Replace the segment dimension with each columns most excited segment.
-            raw_excitment = np.max(raw_excitment, axis=-1)
-            raw_excitment = raw_excitment.reshape(-1)
+            excitment = np.max(excitment, axis=-1)
+            raw_excitment = excitment.reshape(-1)
         else:
             raw_excitment = self.proximal.compute(input_sdr=input_sdr).reshape(-1)
 
-        # Logarithmic Boosting Function.
-        if args.boosting_alpha is not None:
-            boost = np.log2(self.boosting.activation_frequency) / np.log2(args.sparsity)
-            boost = np.nan_to_num(boost)
-            raw_excitment = boost * raw_excitment
+            # Logarithmic Boosting Function.
+            if args.boosting_alpha is not None:
+                boost = np.log2(self.boosting.activation_frequency) / np.log2(args.sparsity)
+                boost = np.nan_to_num(boost)
+                raw_excitment = boost * raw_excitment
 
         # Fast Local Inhibition
         if self.topology:
@@ -447,127 +456,6 @@ class SpatialPooler:
         return stats
 
 
-class Dendrite:
-    """
-    """
-    def __init__(self, input_sdr, active_sdr,
-        segments_per_cell,
-        synapses_per_segment,
-        predictive_threshold,
-        learning_threshold,
-        permanence_thresh,
-        permanence_inc,
-        permanence_dec,
-        mispredict_dec,
-        add_synapses,
-        initial_segment_size,
-        ):
-        """!"""
-        # TODO: copy the docstrings from synapse manager since this is a pass through
-        assert(isinstance(input_sdr, SDR))
-        assert(isinstance(active_sdr, SDR))
-        self.input_sdr            = input_sdr
-        self.active_sdr           = active_sdr
-        self.segments_per_cell    = int(round(segments_per_cell))
-        self.synapses_per_segment = int(round(synapses_per_segment))
-        self.add_synapses         = int(round(add_synapses))
-        self.initial_segment_size = int(round(initial_segment_size))
-        self.predictive_threshold = predictive_threshold
-        self.learning_threshold   = learning_threshold
-
-        self.synapses = SynapseManager(
-            input_sdr         = input_sdr,
-            output_sdr        = SDR((self.active_sdr.size, self.segments_per_cell)),
-            permanence_thresh = permanence_thresh,
-            permanence_inc    = permanence_inc,
-            permanence_dec    = permanence_dec,)
-        self.mispredict_dec   = mispredict_dec
-
-    def compute(self, input_sdr=None):
-        self.excitement          = self.synapses.compute(input_sdr=input_sdr)
-        self.predictive_segments = self.excitement >= self.predictive_threshold
-        self.predictions         = np.sum(self.predictive_segments, axis=1)
-        return self.predictions.reshape(self.active_sdr.dimensions)
-
-    def learn(self, active_sdr=None,):
-        """!"""
-        self.active_sdr.assign(active_sdr)
-        self._mispredict()
-        self._reinforce()
-        self._add_synapses()   # Call reinforce before add_synapses!
-
-    def _mispredict(self):
-        """
-        All mispredicted segments receive a small permanence penalty (predictive
-        segments in inactive neurons).  This penalizes only the synapses with
-        active presynapses.
-        """
-        mispredictions = np.array(self.predictive_segments)
-        mispredictions[self.active_sdr.flat_index] = 0
-        self.synapses.learn_outputs(output_sdr     = mispredictions,
-                                    permanence_inc = -self.mispredict_dec,
-                                    permanence_dec = 0,)
-
-    def _reinforce(self):
-        """
-        Reinforce segments which correctly predicted their neurons activation.
-        Allows all segments which meet the learning threshold to learn.
-        """
-        self.learning_segments = self.excitement[self.active_sdr.flat_index] >= self.learning_threshold
-        active_num, seg_idx    = np.nonzero(self.learning_segments)
-        active_idx             = self.active_sdr.flat_index[active_num]
-        self.synapses.learn_outputs(output_sdr = (active_idx, seg_idx),)
-
-    def _add_synapses(self):
-        # Add more synapses to learning segments in neurons which are both
-        # active and unpredicted.
-        unpred_active_mask = np.logical_not(self.predictions[self.active_sdr.flat_index])
-        neur_num, seg_idx  = np.nonzero(self.learning_segments[unpred_active_mask])
-        neur_idx           = self.active_sdr.flat_index[neur_num]
-        self.synapses.add_synapses(
-            output_sdr          = (neur_idx, seg_idx),
-            synapses_per_output = self.add_synapses,
-            maximum_synapses    = self.synapses_per_segment)
-
-        # Start new segments on active neurons with no learning segments. Use
-        # the segments with the fewest existing synapses, which improves the
-        # amount of room for the new segment to grow as well as evenly
-        # distributes synapses amongst the segments.
-        need_more_segments_mask = np.logical_not(np.any(self.learning_segments, axis=1))
-        neur_idx                = self.active_sdr.flat_index[need_more_segments_mask]
-        if len(neur_idx):
-            segment_sources     = self.synapses.postsynaptic_sources.reshape(self.synapses.outputs.dimensions)
-            segment_sizes       = np.array([[seg.shape[0] for seg in seg_slice]
-                                    for seg_slice in segment_sources[neur_idx, :]])
-            seg_idx             = np.argmin(segment_sizes, axis=1)
-            self.synapses.add_synapses(
-                    output_sdr          = (neur_idx, seg_idx),
-                    synapses_per_output = self.initial_segment_size,
-                    maximum_synapses    = self.synapses_per_segment)
-
-    def statistics(self):
-        stats = ''
-
-        # TODO: These should report both the individual neuron and the
-        # population wide error rates.  (multiply by pop size?)
-        stats += 'Theoretic False Positive Rate  {:g}\n'.format(
-            float(self.synapses.inputs.false_positive_rate(
-                self.synapses_per_segment,
-                self.predictive_threshold,
-            ))
-        )
-        for noise in [5, 10, 20, 50]:
-            stats += 'Theoretic False Negative Rate, {}% noise, {:g}\n'.format(
-                noise,
-                float(self.synapses.inputs.false_negative_rate(
-                    noise/100,
-                    self.initial_segment_size,
-                    self.predictive_threshold,
-                ))
-            )
-        return stats
-
-
 class TemporalMemoryParameters(Parameters):
     parameters = [
         'add_synapses',             # How many new synapses to add to subthreshold learning segments.
@@ -596,12 +484,7 @@ class TemporalMemoryParameters(Parameters):
         initial_segment_size    = 10,
         ):
         # Get the parent class to save all these parameters as attributes of the same name.
-        kw_args = locals()
-        # Double underscores are magic and come and go as they please.  Filter them all out.
-        dunder  = lambda name: name.startswith('__') and name.endswith('__')
-        kw_args = {k:v for k,v in kw_args.items() if not dunder(k)}
-        del kw_args['self']
-        super().__init__(**kw_args)
+        super().__init__(**{k:v for k,v in locals().items() if k != 'self'})
 
 class TemporalMemory:
     """
@@ -635,8 +518,8 @@ class TemporalMemory:
         self.mean_anomaly        = 0
 
         self.basal = Dendrite(
-            input_sdr            = context_sdr if context_sdr is not None else self.active,
-            active_sdr           = self.active,
+            input_sdr            = SDR(context_sdr if context_sdr is not None else self.active),
+            active_sdr           = SDR(self.active),
             segments_per_cell    = args.segments_per_cell,
             synapses_per_segment = args.synapses_per_segment,
             initial_segment_size = args.initial_segment_size,
@@ -702,6 +585,8 @@ class TemporalMemory:
         ########################################################################
         # PHASE 1:  Make predictions based on the previous timestep.
         ########################################################################
+        if context_sdr is None:
+            context_sdr = self.active
         basal_predictions = self.basal.compute(input_sdr=context_sdr)
         predictions       = basal_predictions
 
@@ -752,6 +637,14 @@ class TemporalMemory:
 
         self.active.index = tuple(np.concatenate([predicted_active, burst_active], axis=1))
 
+        # Only tell the dendrite about active cells which are allowed to learn.
+        bursting_learning = (
+            bursting_columns,
+            np.random.randint(0, self.cells_per_column, size=len(bursting_columns)))
+        # TODO: This will NOT work for CONTEXT, TM ONLY.
+        self.basal.input_sdr.assign(self.basal.active_sdr) # Only learn about the winner cells from last cycle.
+        self.basal.active_sdr.index = tuple(np.concatenate([predicted_active, bursting_learning], axis=1))
+
         # Anomally metric.
         self.anomaly      = np.array(burst_active).shape[1] / len(self.active)
         alpha             = self.anomaly_alpha
@@ -763,25 +656,30 @@ class TemporalMemory:
         """
         if self.reset_state:
             # Learning on the first timestep after a reset is not useful. The
-            # issue is that waking up after a reset can not be predicted by
-            # short term memory so don't try to.
+            # issue is that waking up after a reset is inherently unpredictable.
             self.reset_state = False
             return
 
-        # NOTE: This will add synapses to all neurons which are unpredicted and
-        # active, and it does NOT look at the other segments for predictions...
-        # Either modify each dendrites internal predictions array or overhaul
-        # the way synapses are added and managed.  Regardless, these extras
-        # synapses shouldn't hurt...
-        self.basal.learn(active_sdr=self.active)
+        # NOTE: All cells in a bursting mini-column will learn.  This includes
+        # starting new segments if necessary.  This is different from Numenta's
+        # TM which choses one cell to learn on a bursting column.  If in fact
+        # all newly created segments work correctly, then I may in fact be
+        # destroying any chance of it learning a unique representation of the
+        # anomalous sequence by assigning all cells to represent it.  I was
+        # thinking that maybe this would work anyways because the presynapses
+        # are chosen randomly but now its evolved an initial segment size of 19!
+        # FIXED?
+
+        # Use the SDRs which were given durring the compute phase.
+        # inputs = previous winner cells, active = current winner cells
+        self.basal.learn(active_sdr=None)
         if self.apical is not None:
             self.apical.learn(active_sdr=self.active)
         if self.inhibition is not None:
             self.inhibition.learn(active_sdr=self.active)
 
     def statistics(self):
-        stats = 'Temporal Memory ' + self.basal.synapses.statistics()
-
+        stats  = 'Temporal Memory\n'
         stats += 'Predictive Segments ' + self.basal.statistics()
         if self.apical is not None:
             stats += 'Apical Segments ' + self.apical.statistics()
@@ -791,416 +689,6 @@ class TemporalMemory:
         stats += "Mean anomaly %g\n"%self.mean_anomaly
         stats += 'Activation statistics ' + self.active.statistics()
 
-        return stats
-
-
-"""
-EXPERIMENT:  I want to check that the B.G. output can encode recognizable
-actions.  Use a statistical classifier to correlate the BG output with the motor
-output and then test if the BG+classifier can function.
-
-My hypothesis is that the striatum does not encode recognisable actions.
-Experiment with creating a thalamus which accepts L5 state (with topology) and
-learns to control L5 via apical control (with topology).  The BG would then
-control whether the thalamus is excitory or inhibitory.
-"""
-
-# TODO: Should burst cells actually activate?  It would make them participate
-# in the apical control too, also learning apical control.  Currently the burst
-# cells learn but are NOT put on the active list.  Also the suppressed cells are
-# kept on the active list...
-#
-class StriatumPopulation:
-    """
-    This class models the D1 and the D2 populations of neurons in the striatum of
-    the basal ganglia.
-    """
-    def __init__(self, basal_ganglia, size):
-        self.args = args = basal_ganglia.args
-        self.size        = size
-        self.synapses    = SynapseManager(
-            input_sdr           = basal_ganglia.inputs,
-            output_sdr          = SDR((size, basal_ganglia.segments_per_cell)),
-            permanence_thresh   = args.permanence_thresh,)
-
-        self.active  = SDR((size,))
-
-    def compute(self):
-        """
-        Computes each neurons excitement.  This saves all the intermediate
-        state which is needed for learning later.
-        """
-        # Determine which segments activated and count them.
-        self.segment_excitement = self.synapses.compute()
-        self.active_segments    = self.segment_excitement >= self.args.predictive_threshold
-        self.excitement         = np.sum(self.active_segments, axis=1)
-        # Break ties randomly.
-        self.excitement         = self.excitement + np.random.uniform(0, .5, size=self.size)
-        return self.excitement
-
-    # TODO: Move this method back to the BG class, it doesn't belong here.  Consider merging this method with the TD_Error method.
-    def imbalance(self, td_error):
-        """
-        The imbalance is the number of additional D1 neurons and fewer D2
-        neurons which should have activated to predict the correct value.
-        This method discards the sign of TD Error and returns the absolute 
-        magnitude of the imbalance.
-        """
-        k = self.args.num_neurons * self.args.sparsity
-        return int(round(abs(td_error) * k / 2))   # Is okay? Guess and check.
-
-    def strengthen(self, td_error):
-        """
-        Strengthen this population.  This chooses imbalance many neurons to
-        learn about the current input pattern, only the most excited
-        inactive neurons are chosen to learn.
-        """
-        imbalance     = self.imbalance(td_error)
-        if imbalance == 0:
-            return
-        actual_active = len(self.active)
-        target_active = actual_active + imbalance
-        burst         = np.argpartition(-self.excitement, (actual_active, target_active))
-        burst         = burst[actual_active : target_active]
-        # All segments on bursting neurons which meet or excede the learning
-        # threshold will learn.
-        learning_segments_dense    = self.segment_excitement[burst] >= self.args.learning_threshold
-        learn_cell_num, learn_segs = np.nonzero(learning_segments_dense)
-        # The following line undoes the effect of selecting bursting neurons
-        # before the nonzero operation.
-        learn_cells = burst[learn_cell_num]
-        self.synapses.learn_outputs(output_sdr     = (learn_cells, learn_segs),
-                                    permanence_inc = self.args.permanence_inc,
-                                    permanence_dec = self.args.permanence_dec,)
-
-        # Add synapses to bursting neuron segments.  Specifically, subthreshold
-        # learning segments should receive more synapses.
-        subthreshold_learning_segs = np.logical_and(
-                                            learning_segments_dense,
-                                            np.logical_not( self.active_segments[burst] ))
-        add_syn_cell_num, add_syn_seg = np.nonzero(subthreshold_learning_segs)
-        add_syn_cell = burst[add_syn_cell_num] # Fix nonzero after removing unwanted data.
-        self.synapses.add_synapses( output_sdr          = (add_syn_cell, add_syn_seg),
-                                    synapses_per_output = self.args.add_synapses,
-                                    maximum_synapses    = self.args.synapses_per_segment)
-
-        # Give bursting neurons with no learning segments more synapses on new
-        # segments.  Pick segments with few existing potential synapses on them,
-        # which should make sure the segments are used to their full potential,
-        # and not clumping too many synapses on too few segments.
-        # TODO: This could count the number of *connected* inputs?
-        need_more_segs = np.sum(subthreshold_learning_segs, axis=1) < 2 # Hardcoded Number!
-        need_more_segs = burst[need_more_segs]
-        if len(need_more_segs):
-            sources    = self.synapses.postsynaptic_sources.reshape(self.synapses.outputs.dimensions)
-            # Sources shape = (cells, segments)
-            syn_counts = np.array([[seg.shape[0] for seg in seg_slice]
-                                        for seg_slice in sources[need_more_segs]])
-            syn_counts = syn_counts + np.random.uniform(0, .5, size=syn_counts.shape)   # break ties randomly
-            new_seg    = np.argmin(syn_counts, axis=1)
-            self.synapses.add_synapses( output_sdr          = (need_more_segs, new_seg),
-                                        synapses_per_output = self.args.initial_segment_size,
-                                        maximum_synapses    = self.args.synapses_per_segment)
-
-    def weaken(self, td_error):
-        """
-        Weaken this population.  This supresses the least excited but
-        still active neurons, penalizing all learning segments on those
-        neurons so they will ignore this input pattern in the future.
-        """
-        imbalance          = self.imbalance(abs(td_error))
-        if imbalance == 0:
-            return
-        # Find which neurons to supress.
-        actual_active      = len(self.active)
-        target_active      = max(0, actual_active - imbalance)
-        active_excitement  = self.excitement[self.active.flat_index]
-        partitioned_active = np.argpartition(-active_excitement, target_active)
-        supress_active_num = partitioned_active[target_active:]
-        allow_active_num   = partitioned_active[:target_active]
-        # The following lines undo the effect of selecting the active neurons
-        # before the argpartition.
-        supress            = self.active.flat_index[supress_active_num]
-        allow              = self.active.flat_index[allow_active_num]
-        # self.active.flat_index = allow
-
-        # Find which segments on the supressed neurons to weaken.
-        learning_segments = self.segment_excitement[supress] >= self.args.learning_threshold
-        learn_cell_num, lean_segs = np.nonzero(learning_segments)
-        # The following line undoes the effect of selecting the supressed
-        # neurons before the nonzero operation.
-        learn_cells = supress[learn_cell_num]
-        self.synapses.learn_outputs(output_sdr     = (learn_cells, lean_segs),
-                                    permanence_inc = -self.args.permanence_dec,
-                                    permanence_dec = 0,)
-
-    def copy(self):
-        """
-        Make a shallow copy of this population so that it can learn, next cycle
-        when the TD Error is known.
-        """
-        cpy          = copy.copy(self)
-        cpy.synapses = self.synapses.copy()
-        cpy.active   = SDR(self.active)
-        return cpy
-
-class BasalGangliaParameters(Parameters):
-    parameters = [
-        'permanence_dec',
-        'permanence_inc',
-        'permanence_thresh',
-        'mispredict_dec',
-        'predictive_threshold',
-        'learning_threshold',
-        'd1d2_ratio',
-        'num_neurons',
-        'apical_segments',
-        'segments_per_cell',
-        'sparsity',
-        'synapses_per_segment',
-        'td_lambda',
-        'future_discount',
-        'apical_segment_excite',
-        'apical_segment_inhibit',
-        'apical_voluntary',
-        'apical_inhibit',
-        'add_synapses',             # How many synapses to add to subthreshold learning segments.
-        'initial_segment_size',     # How many synases to start new segments with.
-    ]
-
-class BasalGanglia:
-    comment = """
-        The Basal Ganglia (B.G.) performs reinforcement learning using the TD-Lambda
-        algorithm.  This section attempts to explain the algorithm.  When B.G.
-        neurons activate they learn, locking onto input patterns, and they compete
-        with other B.G. neurons in much the same way as spatial pooler mini-columns
-        do.  Within the B.G. there are two subtypes of neurons, called D1 and D2.
-        The purpose of D1 neurons is to learn about positive rewards and D2 neurons
-        learn about negative rewards (penalties).  Put together, D1 and D2 neurons
-        form an estimate the expected value (summation) of rewards in the near
-        future as well as a stabile representation of the current reward state.  It
-        is called an estimate but it is also a prediction of the future.  How far
-        into the future neurons concern themselves with is determined by the
-        parameter 'future_discount'.  The expected value is a function of the number
-        of active D1 cells and the number of active D2 cells.
-
-        Every cycle the B.G. makes a new estimate/prediction of the expected value,
-        adds to it any rewards which were received in the time between cycles, and
-        compares it to the old estimate.  The difference between the old and new
-        estimates is called the TD-Error.  A positive TD-Error indicates an
-        unexpected reward while a negative TD-Error indicates an unexpected penalty.
-        Notice that a reward is as good as the expectation of a reward, and that the
-        new estimate is provably more accurate than the old one because the new
-        estimate includes information about actual rewards received.
-
-        D1 neurons only learn when the TD-Error is positive and D2 neurons only
-        learn when the TD-Error is negative, and in both cases the learning rate is
-        proportional to the absolute magnitude of the TD-Error.  In this way D1 and
-        D2 neurons learn to recognise different events given the same inputs.
-        Because B.G. neurons are not representing the current state of anything, but
-        rather a prediction of the future, they do not learn when they activate.
-        Instead they learn for a period of time immediately after each activation.
-        During this learning period B.G. neurons are essentially checking their
-        predictions.  When the TD-Error is non-zero, indicating an unexpected
-        reward, some recently active B.G. neurons will learn to recognise the
-        current input on the assumption that they probably should have seen the
-        reward comming, and the next time this unexpected situtation occurs some of
-        the neurons which learned about it should activate and improve the expected
-        value estimate, ultimately leading to a reduced TD-Error.
-
-        B.G. neurons use eligability traces to keep track of how recently they
-        activated and if they can learn.  Active neurons set their eligability trace
-        to '1' and all traces exponentially decay towards zero.  Each neurons
-        learning rate is multiplied by its eligability trace, which implements the
-        window of time following each activation when a neuron can learn corrections
-        based on the TD-Error signal.  The parameter 'td_lambda' controls how fast
-        traces decay.  TD-Lambda == 0 causes neurons to only learn in the next cycle
-        and TD-Lambda == 1 causes neurons learn forever.  Conceptually, a neurons
-        trace indicates how relevent it is to the current situtation.
-
-        The TD-Error determines how many neurons in each population learn.  If a
-        population should have had more activations, then the most excited sub-
-        threshold neurons burst.  If a population should have had fewer activations,
-        then the least excited active neurons are penalized.
-
-        When either population has too few recent activations to learn about the TD-
-        Error, then additional neurons are choosen to represent it.  These neurons
-        burst and immediately learn.
-
-        Bursting.  If there aren't enough neurons active for the TD-Error to
-        influence then more neurons are chosen to activate and immediately represent
-        the current input.  For example if there are no D2 neurons active (cause its
-        been a good day) but then anything bad happens, then there are no eligable
-        D2 neurons to learn...
-            - Which neurons? the more excited ones are prefered.
-            - When? Under what conditions?
-            - How many?
-
-        Add synapses ... Maybe to only bursting neurons
-            - when & which neurons & which segments
-
-        Mispredict
-        Penalty ... active segments on inactive neurons are weakened?
-
-        Representational Power ... talk about what this does to ensure that all of
-        the available neurons are used in distinctive ways.
-            - Boosing? track activation freq?
-            - This is a measurable output of the B.G., how to test it?
-
-        Finally talk about the output synapses ... IS THE FOLLOWING CORRECT?
-        Adapt apical dendrites.  The Basal Ganglia outputs bias the agent's actions
-        and the BG uses them to maximize its reward.  The given outputs are the L5
-        activity of the previous cycle, which indirectly caused/affected the current
-        inputs, reward, and TD-Error.  Adapt last cycle's active outputs to
-        associate the recent BG activity (which is stored in the elegability traces)
-        with the TD-Error that the output activations yielded. Do this step before
-        incorperating the current BG activity into the traces. This way the output
-        is learning to recognise the BG state at the time when it took action, not
-        after???
-        """
-    def __init__(self, parameters, input_sdr, output_sdr):
-        """
-        Argument input_sdr is an instance of SDR, state of world to determine
-                 expected value from.
-        Argument output_sdr is an instance of SDR, L5 layer activations, these
-                 are biased by the basal ganglia.  Both input_sdr and output_sdr
-                 should be computed in the same cycle.
-        """
-        assert(isinstance(parameters, BasalGangliaParameters))
-        assert(isinstance(input_sdr, SDR))
-        assert(isinstance(output_sdr, SDR))
-        self.args = args        = parameters
-        self.inputs             = input_sdr
-        self.outputs            = output_sdr
-        self.apical_control     = (SDR(output_sdr.dimensions), SDR(output_sdr.dimensions))
-        self.num_neurons        = int(round(args.num_neurons))
-        self.segments_per_cell  = int(round(args.segments_per_cell))
-        self.apical_segments    = int(round(args.apical_segments))
-        num_d1                  = int(round(self.num_neurons * args.d1d2_ratio))
-        num_d2                  = self.num_neurons - num_d1
-        self.d1                 = StriatumPopulation(self, num_d1)
-        self.d2                 = StriatumPopulation(self, num_d2)
-        self.reset()
-
-    def reset(self):
-        # self.d1_traces = np.zeros(self.num_d1, dtype=PERMANENCE)
-        # self.d2_traces = np.zeros(self.num_d2, dtype=PERMANENCE)
-        self.expected_value = None
-        self.td_error       = 0     # Is used for diagnostics.
-        self.apical_control[0].zero()
-        self.apical_control[1].zero()
-        self.d1_inc = 0
-        self.d1_dec = 0
-        self.d2_inc = 0
-        self.d2_dec = 0
-
-    def expected_value_func(self, d1, d2):
-        """
-        Calculate the expected value. Sungur keeps track of each neurons value,
-        which is updated after learning.  I want to take the ratio of active
-        d1/d2 cells because its simpler and I think that assuming that some
-        cells have values other than their binary activations is not going to
-        work. Striatum cells fire under numerous circumstances, theres no way
-        one value is going to work, and averaging many won't help. arctan2(d1,
-        d2) will bring the expected value to the range [0, pi/2] The expected
-        value needs to gel with the rewards, which are not bounded to any
-        particular range or units.  I could rescale the rewards based on what
-        keeps the expected value in a happy range?  I could use a genetic
-        parameter to scale the reward to a range which works.
-
-        fraction = (|D1| - |D2|) / (|D1| + |D2|)        # Range [-1, 1]
-        theta    = fraction * pi/2                      # Range [-pi/2, pi/2]
-        value    = tan(theta) * RewardSensitivity       # Range [-inf, inf]
-        """
-        d1 = len(d1)
-        d2 = len(d2)
-        new_expected_value = (d1 - d2) / (d1 + d2)
-        return new_expected_value
-
-    # TODO: Consider adding boosting, like SP does.  This could help ensure that
-    # all BG neurons are used.
-    def compute(self, reward):
-        """
-        Argument reward ... set to None to disable learning.
-        """
-        # Activate the neurons with the most active segments.
-        d1_excitement = self.d1.compute()
-        d2_excitement = self.d2.compute()
-        segments      = np.concatenate([d1_excitement, d2_excitement])
-        k             = max(1, int(round(self.args.sparsity * self.num_neurons)))
-        active        = np.argpartition(-segments, k)[:k]
-        self.d1.active.flat_index = active[active <  self.d1.size]
-        self.d2.active.flat_index = active[active >= self.d1.size] - self.d1.size
-
-        new_expected_value = self.expected_value_func(self.d1.active, self.d2.active)
-
-        # Learn.
-        if reward is not None and self.expected_value is not None:
-            td_error = (reward + new_expected_value * self.args.future_discount) - self.expected_value
-            self.td_error = td_error        # Is used for diagnostics.
-
-            """
-            EXPERIMENT:  TD-Error = sign(TD-Error) * log(1 + abs(TD-Error))
-            Clean up TD-Error.  Currently TD-Error is a function of the expected
-            values and the reward, all of which can have arbitrary ranges.  TD-
-            Error is then used to modify all of the synapses by an undetermined
-            amount.  I think the safest thing to do is take the logarithm of TD-
-            Error because it almost always in a good range. Conceptually, the
-            logarithm converts TD-Error into the scale that would be needed to
-            represent it, in base e of course.  After this transform, the TD-
-            Error is sensitive to percent changes in the reward/expected value
-            instead of additive/subtractive changes.
-            """
-            # The sign and magitude of the TD-Error determine which population
-            # (D1/D2) learns and how fast.  Only active neurons learn (or
-            # recently active, as recorded in the elegability traces), and
-            # within a learning neuron all segments which meet the
-            # learning_threshold are adapted to recognise the current input.
-            if td_error > 0:
-                self.prev_d1.strengthen(td_error)
-                self.prev_d2.weaken(td_error)
-            elif td_error < 0:
-                self.prev_d2.strengthen(-td_error)
-                self.prev_d1.weaken(-td_error)
-
-            # Apical synapses learn.  Apical synapses are managed by the TM
-            # class, save as attributes the necessary permanence update
-            # information for the TM class to use.
-            inc = self.args.permanence_inc
-            dec = self.args.permanence_dec
-            if td_error > 0:
-                self.d1_inc = inc * abs(td_error)
-                self.d1_dec = dec * abs(td_error)
-                self.d2_inc = - dec * abs(td_error)
-                self.d2_dec = 0
-            else:
-                self.d1_inc = - dec * abs(td_error)
-                self.d1_dec = 0
-                self.d2_inc = inc * abs(td_error)
-                self.d2_dec = dec * abs(td_error)
-
-            # Apical synapse timing:
-            # Cycle 1: Basal Ganglia neurons activate.
-            # Cycle 2: Apical dendrites in the cortex see the new BG activations.
-            #          Basal Ganglia neurons see the cortical activations which
-            #          contain info about the current state of the world as well
-            #          as the current actions.
-            #          Basal Ganglia makes a new value estimate.
-            #          BG uses TD error to adjust the apical synapses such that
-            #          last cycle's activity causes this cycles (positive TD Error case)
-
-        # Save (shallow) copies of the D1 and D2 population objects and other
-        # things which are needed for learning.
-        self.prev_d1                  = self.d1.copy()
-        self.prev_d2                  = self.d2.copy()
-        self.expected_value           = new_expected_value
-
-    def statistics(self):
-        # TODO: The TD-Error is a measure of how well the BG is representing the
-        # expected value, and I should monitor it throughout the training to
-        # show that it decreases with learning.
-        stats = 'Basal Ganglia Statistics\n'
-        stats += 'Avg TD Error %g\n'%self.mean_td_error
         return stats
 
 

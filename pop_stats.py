@@ -5,6 +5,7 @@ from mnist_sp import *
 # from tm_numbers_test import *
 # from eye_experiment import *
 # from htm_agent import *
+from bg_test import *
 from stability_experiment import *
 from eye_sp import *
 import genetics
