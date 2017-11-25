@@ -196,6 +196,20 @@ class SparseDistributedRepresentation:
         self.average_overlap = (1 - alpha) * self.average_overlap + alpha * overlap
         self._prev_value     = SDR(self)
 
+    def _dead_cell_filter(self):
+        if self._index is not None:
+            flat_index  = np.ravel_multi_index(self._index, self.dimensions)
+            flat_index  = np.setdiff1d(flat_index, self._dead_cells)
+            self._index = np.unravel_index(flat_index, self.dimensions)
+
+        if self._flat_index is not None:
+            self._flat_index = np.setdiff1d(self._flat_index, self._dead_cells)
+
+        if self._dense is not None:
+            self._dense.shape = -1
+            self._dense[self._dead_cells] = 0
+            self._dense.shape = self.dimensions
+
     def __len__(self):
         """Returns the number of active bits in current SDR."""
         return len(self.flat_index)
@@ -353,6 +367,15 @@ class SparseDistributedRepresentation:
         # noisy.dense[list(zip(*flip_off))] = False
         # noisy.dense[list(zip(*flip_on))]  = True
         return noisy
+
+    def kill_cells(self, percent):
+        """
+        Short Description ...
+        Argument percent ...
+        """
+        num_cells        = int(round(self.size * percent))
+        self._dead_cells = np.random.choice(self.size, num_cells, replace=False)
+        self._callbacks.append(type(self)._dead_cell_filter)
 
     def statistics(self):
         """Returns a string describing this SDR."""

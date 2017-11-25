@@ -4,23 +4,6 @@ Written by David McDougall 2017
 
 The purpose of this experiment is to test the basal ganglia system with out
 needing actions or motors of any kind.
-
-Ideas for interesting datasets:
-1) Adjust reward magnitudes (but not the signs), this isolates learning to the GP.
-    TODO: Striatum works.  Plot D1 & D2 classification accuracy as a function of the
-    sequences value.  This plot should clearly show what each population knows and
-    does not know.  Then randomly change the magnitude (but not the sign) of all
-    rewards and retrain the network.  Show that the striatum's knowledge is
-    unchanged, and that the GP has made the needed adjustments.
-2) Adversarial situations which force the striatum or GP to do weird things.
-    Make the GP compare many small rewards with a large punishment (and vise versa)
-3) Generalization tests.  Build a simple language and generate sentences and see
-    if the TM can learn the basic pattern well enough for the striatum to
-    represent it and for the the GP to value it.
-4) Capacity tests which take an existing test and scale it up.  Plot dataset
-    size versus performance.  Discuss how TD-Lambda == 0 effects learning speed.
-
-
 """
 
 import numpy as np
@@ -30,6 +13,9 @@ import random
 import genetics
 from sdr import SDR
 import basal_ganglia
+import time
+from matplotlib import pyplot as plt
+
 
 class Dataset:
     """
@@ -40,8 +26,7 @@ class Dataset:
     A random number of random inputs are inserted between each sequence, and
     which sequence is played is randomly chosen.
     """
-    def __init__(self,
-        num_sequences   = 50,
+    def __init__(self, num_sequences,
         sequence_length = range(4, 20),
         filler_length   = range(2, 4),):
         """
@@ -62,6 +47,7 @@ class Dataset:
                 self.sequences[-1].append(random.choice(self.inputs))
             self.rewards.append(random.uniform(-1, 1))
         self.state = ('filler', 1)
+        print('Num Sequences', num_sequences)
 
     def __next__(self):
         """
@@ -98,7 +84,7 @@ class Dataset:
 
     def adjust_rewards(self):
         """Randomly adjust the magnitude (but not the sign) of all rewards."""
-        for r, idx in enumerate(self.rewards):
+        for idx, r in enumerate(self.rewards):
             if r >= 0:
                 self.rewards[idx] = random.uniform(0, 1)
             else:
@@ -112,10 +98,10 @@ class AdversarialDataset(Dataset):
     a large punishment.
     """
     def __init__(self):
-        super().__init__(num_sequences = 10,)
+        super().__init__(num_sequences = 10)
         self.sequences = []
         self.rewards = []
-        common_start = [random.choice(self.inputs) for step in range(6)]
+        common_start = [random.choice(self.inputs) for step in range(4)]
         for seq in range(10):
             ending_length = random.randrange(2, 5)
             ending = [random.choice(self.inputs) for step in range(ending_length)]
@@ -124,18 +110,13 @@ class AdversarialDataset(Dataset):
         for seq in range(9):
             self.rewards.append(random.uniform(0, .5))      # Small Rewards
         for seq in range(1):
+            self.sequences[-1] = [random.choice(self.inputs)] + self.sequences[-1]
             self.rewards.append(random.uniform(-1, -.5))    # Large Punishment
 
-
-class PatternDataset(Dataset):
-    """
-    Build a simple language and generate sentences and see if the TM can learn
-    the basic pattern well enough for the striatum to represent it and for the
-    the GP to value it.
-    """
-    def __init__(self):
-        super().__init__(num_sequences = 100,)
-        1/0 # Unimplemented.
+        print("ADVERSARIAL DATASET:")
+        for seq, r in zip(self.sequences, self.rewards):
+            print(' '.join(seq) + '   ' + str(r))
+        print()
 
 
 class BG_Test(genetics.Individual):
@@ -155,40 +136,40 @@ class BG_Test(genetics.Individual):
         'seq_d1':       0,
         'seq_d2':       0,
         'td_error':    -2,
-        'time':        -1,
+        'time':         0,
         'memory':      -1,
     }
 
     def __init__(self):
-        # Updated 11/17/2017 from test6
+        # Updated 11/19/2017 from test7_seq50
         self.bg = basal_ganglia.BasalGangliaParameters(
             d1d2_ratio = 0.5,
             gp = basal_ganglia.GlobusPallidusParameters(
                 add_synapses         = 10,
                 initial_segment_size = 28.668820802153853,
                 learning_threshold   = 0.5,
-                num_neurons          = 1477.8991746705415,
+                num_neurons          = 1880.6824506733199,
                 permanence_dec       = 0.02,
-                permanence_inc       = 0.14515840704318025,
+                permanence_inc       = 0.104374614028441,
                 predictive_threshold = 1,
-                segments_per_cell    = 100,
-                sparsity             = 0.11932199421272612,
-                synapses_per_segment = 88.46359570430134,),
-            num_msn = 1400.7474298618658,
+                segments_per_cell    = 70.00388570894219,
+                sparsity             = 0.11539176579701424,
+                synapses_per_segment = 113.15265579455316,),
+            num_msn = 2000,
             striatum = basal_ganglia.StriatumParameters(
                 add_synapses         = 3,
-                initial_segment_size = 10,
+                initial_segment_size = 14.645374604733492,
                 learning_threshold   = 5,
                 mispredict_dec       = 0.001,
                 permanence_dec       = 0.01,
                 permanence_inc       = 0.03,
                 permanence_thresh    = 0.25,
-                predictive_threshold = 7,
-                segments_per_cell    = 79.98172860414674,
+                predictive_threshold = 4.821440046598965,
+                segments_per_cell    = 100,
                 sparsity             = 0.04,
                 synapses_per_segment = 47.3462661964499,),)
         self.cols = 2115.444367490216
-        self.enc_bits = 3000
+        self.enc_bits = 4089.1445640190263
         self.enc_spar = 0.15
         self.sp = htm.SpatialPoolerParameters(
             boosting_alpha    = 0.0008051932203712806,
@@ -200,11 +181,11 @@ class BG_Test(genetics.Individual):
         self.tm = htm.TemporalMemoryParameters(
             add_synapses         = 10,
             cells_per_column     = 12,
-            initial_segment_size = 20,
+            initial_segment_size = 28.986719240164838,
             learning_threshold   = 6,
             mispredict_dec       = 0.001051,
-            permanence_dec       = 0.01,
-            permanence_inc       = 0.03,
+            permanence_dec       = 0.011685689447103092,
+            permanence_inc       = 0.04112000756858246,
             permanence_thresh    = 0.2,
             predictive_threshold = 8,
             segments_per_cell    = 50,
@@ -212,11 +193,19 @@ class BG_Test(genetics.Individual):
 
     debug  = False
     cycles = None   # Set by main function.
+    num_seq = None   # Set by main function.
     def evaluate(self):
-        datastream = Dataset()
-        timer      = genetics.speed_fitness(20, 30)
+        cell_death_experiment          = None
+        reward_adjustment_experiment   = False
+        adversarial_dataset_experiment = False
+
+        if adversarial_dataset_experiment:
+            datastream = AdversarialDataset()
+        else:
+            datastream = Dataset(num_sequences = self.num_seq)
 
         # SETUP AI.
+        start_time = time.time()
         enc = htm.EnumEncoder(self.enc_bits, self.enc_spar, diag=False)
         sp  = htm.SpatialPooler(self.sp,
                                 input_sdr  = enc.output_sdr,
@@ -243,6 +232,7 @@ class BG_Test(genetics.Individual):
         sequence_total = 0
         td_error = 0; td_error_total = 0    # RMS of TD-Error
         baseline = 0    # RMS(reward). If EV === 0 then this is also the RMS TD-Error.
+        event_step = None  # A vertical line is drawn on the TD-Error graph at this step.
         if self.debug:
             input_history = []
             reward_history = []
@@ -281,13 +271,13 @@ class BG_Test(genetics.Individual):
                 d2_seq_scores[seq_idx] /= seqence_classification_samples
             # Plot the relationship between sequence value and which striatum
             # populations learned to recognise the sequence.
-            from matplotlib import pyplot as plt
             plt.figure('Reward versus Striatum')
             plt.subplot(1, 2, 1)
             plt.title('D1')
             plt.plot(datastream.rewards, d1_seq_scores, 'ro')
             plt.xlabel('Sequence Reward')
             plt.ylabel('Classification Accuracy')
+
             plt.subplot(1, 2, 2)
             plt.title('D2')
             plt.plot(datastream.rewards, d2_seq_scores, 'bo')
@@ -295,6 +285,7 @@ class BG_Test(genetics.Individual):
             plt.ylabel('Classification Accuracy')
 
         # RUN ONLINE.
+        print("Num Cycles", self.cycles)
         for step in range(self.cycles):
             inp, reward = next(datastream)
             enc.encode(inp)
@@ -303,6 +294,15 @@ class BG_Test(genetics.Individual):
             bg.compute(tm.active, reward)
             sp.learn()
             tm.learn()
+
+            if cell_death_experiment is not None and step == self.cycles // 2:
+                tm.active.kill_cells(cell_death_experiment)
+                bg.d1.active.kill_cells(cell_death_experiment)
+                bg.d2.active.kill_cells(cell_death_experiment)
+                bg.gpe.active.kill_cells(cell_death_experiment)
+                bg.gpi.active.kill_cells(cell_death_experiment)
+                print("KILLED %g %% OF CELLS"%(cell_death_experiment*100))
+                event_step = step
 
             # Measure performance.
             if bg.td_error is not None:
@@ -345,6 +345,13 @@ class BG_Test(genetics.Individual):
                 td_error_history.append(bg.td_error if bg.td_error is not None else 0)
                 anomaly_history.append(tm.anomaly)
 
+                if reward_adjustment_experiment and step == self.cycles // 2:
+                    plot_striatum_performance_vs_reward()
+                    plt.show()
+                    print('ADJUSTING ALL REWARDS!')
+                    datastream.adjust_rewards()
+                    event_step = step
+
         # REPORT.
         sp_seq_score = sp_seq_score / sequence_total
         tm_seq_score = tm_seq_score / sequence_total
@@ -362,7 +369,7 @@ class BG_Test(genetics.Individual):
             'seq_d1':       d1_seq_score,
             'seq_d2':       d2_seq_score,
             'td_error':     td_error / baseline,
-            'time':         timer.done(),
+            'time':         (time.time() - start_time) / 60,
             'memory':       memory_score,
         }
         if self.debug:
@@ -374,20 +381,37 @@ class BG_Test(genetics.Individual):
 
             plot_striatum_performance_vs_reward()
 
-            # Plot the TD-Error and anomaly.
-            from matplotlib import pyplot as plt
+            # Plot the Reward, Expected Value, and TD-Error.
             steps = np.arange(len(input_history))
             plt.figure('Reinforcement Learning Graph')
             plt.title('Reward is Red, Expected Value is Green, TD-Error is Blue.')
+            plt.xlabel('Step Number')
             plt.plot(steps, reward_history, 'r',
                      steps, ev_history, 'g',
                      steps, td_error_history, 'b')
+
+            # Plot the Anomaly.
             plt.figure('Anomaly Graph')
             plt.title('Anomaly is Green, Unpredictable input is Red.')
             plt.plot(steps, anomaly_history, 'g',
                      steps, anomalous_input_history, 'r')
-            plt.show()
+            plt.xlabel('Step Number')
 
+            # Smooth and plot the TD error alone.
+            alpha = .005
+            td_err_cleaned = []
+            avg = 0
+            for td_err in td_error_history:
+                avg = avg * (1-alpha) + abs(td_err) * alpha
+                td_err_cleaned.append(avg)
+            plt.figure('TD Error')
+            plt.title('Exponential Rolling average of |TD Error|, alpha = %g'%alpha)
+            plt.plot(steps, td_err_cleaned, 'b')
+            plt.xlabel('Step Number')
+            if event_step is not None:
+                plt.axvline(event_step)
+
+            plt.show()
         return fitness
 
 
@@ -397,13 +421,15 @@ if __name__ == '__main__':
     parser.add_argument('--default_parameters', action='store_true')
     parser.add_argument('--best_parameters',    action='store_true')
     parser.add_argument('--file', type=str,   default='checkpoint')
-    parser.add_argument('-c', '--cycles',     type=int, default=10000)
+    parser.add_argument('-c', '--cycles',     type=int, default=20000)
+    parser.add_argument('-s', '--sequences',  type=int, default=50)
     parser.add_argument('-p', '--population', type=int, default=100)
     parser.add_argument('-n', '--processes',  type=int, default=4)
     parser.add_argument('--profile',          action='store_true')
     args = parser.parse_args()
 
     BG_Test.cycles = args.cycles
+    BG_Test.num_seq = args.sequences
 
     if args.default_parameters or args.best_parameters:
         BG_Test.debug = True

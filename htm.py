@@ -11,7 +11,6 @@ import copy
 from genetics import Parameters
 from encoders import *
 from classifiers import *
-# from basal_ganglia import *
 from sdr import SDR, SynapseManager, Dendrite
 
 

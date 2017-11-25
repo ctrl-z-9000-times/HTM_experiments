@@ -16,6 +16,7 @@ import os, os.path
 import pickle
 import copy
 import csv
+import argparse
 
 class Parameters:
     """
@@ -55,13 +56,10 @@ class Parameters:
         if missing_parameters:
             raise TypeError("%s.__init__() missing parameters: %s"%(type(self).__name__, ', '.join(missing_parameters)))
 
-    def mutate(self, percent):
-        """
-        Randomly change a single parameter by at most the given percent.
-        This uses an exponential mutation rate: (1 + percent) ^ uniform(-1, 1)
-        """
+    def _choose_parameter(self):
+        """This assigns all parameters uniform probability of mutation,
+        except None which is never mutated."""
         def attr_probability(attr):
-            """This assigns all attributes uniform probability of mutation."""
             value = getattr(self, attr)
             if isinstance(value, Parameters):
                 return len(value)
@@ -73,11 +71,55 @@ class Parameters:
                 # Floats and Bools
                 return 1
         # Pick a parameter to mutate and get its value.
-        probabilities   = [attr_probability(attr) for attr in self.parameters]
-        probabilities   = np.array(probabilities) / np.sum(probabilities)
-        param_idx       = np.random.choice(len(self.parameters), p=probabilities)
-        param           = self.parameters[param_idx]
-        value           = getattr(self, param)
+        probabilities = [attr_probability(attr) for attr in self.parameters]
+        probabilities = np.array(probabilities) / np.sum(probabilities)
+        param_idx     = np.random.choice(len(self.parameters), p=probabilities)
+        parameter     = self.parameters[param_idx]
+        return parameter
+
+    def mutate(self, population):
+        """
+        Randomly change a single parameter.  The new value is normaly
+        distributed around the population wide mean and standard deviation.
+        """
+        print("EXPERIMENTIAL MUTATION FUNCTION, UNDER TEST.")
+        min_mean_std_ratio = 1000
+        param = self._choose_parameter()
+        value = getattr(self, param)
+        if isinstance(value, Parameters):
+            value.mutate_standard(percent)
+
+        elif isinstance(value, tuple):
+            # Mutate a random element of tuple.
+            index = random.randrange(len(value)) # Pick an element to mutate.
+            stats = self.population_statistics(population)
+            param_indexed = '%s[%d]'%(param, index)
+            pop_min, pop_mean, pop_std, pop_max = stats[param_indexed]
+            pop_std   = max(pop_std, pop_mean / min_mean_std_ratio)
+            new_value = random.normal(pop_mean, pop_std)
+            # Swap the new element into the tuple.
+            new_tup = tuple(new_value if i==index else elem for i, elem in enumerate(value))
+            setattr(self, param, new_tup)
+
+        else:
+            # Mutate a floating point or boolean number.
+            stats = self.population_statistics(population)[param]
+            pop_min, pop_mean, pop_std, pop_max = stats
+            pop_std   = max(pop_std, pop_mean / min_mean_std_ratio)
+            new_value = random.normal(pop_mean, pop_std)
+            if isinstance(value, bool):
+                new_value = new_value > .5
+            if not ((new_value >= 0) == (value >= 0 )):
+                print('Warning: parameter changed sign', param, 'was', value, 'mutated to', new_value)
+            setattr(self, param, new_value)
+
+    def mutate_old(self, percent):
+        """
+        Randomly change a single parameter by at most the given percent.
+        This uses an exponential mutation rate: (1 + percent) ^ uniform(-1, 1)
+        """
+        param = self._choose_parameter()
+        value = getattr(self, param)
         if isinstance(value, Parameters):
             value.mutate(percent)
         elif isinstance(value, bool):
@@ -130,6 +172,7 @@ class Parameters:
                 setattr(self, attr, child_value)
 
     def __len__(self):
+        """Returns the number of non-None parameters which this instance contains."""
         accum = 0
         for attr in self.parameters:
             value = getattr(self, attr)
@@ -256,7 +299,7 @@ class Individual(Parameters):
     This classes initializer should accept no arguments.  Use class variables to
     store arguments instead; this works because typically all individuals
     recieve the same arguments, often from the command line.  This makes it
-    possible for the Population and evolutionary algorithm to make new
+    possible for the Population class and evolutionary algorithm to make new
     individuals as needed.
 
     This class provides a fitness function and several supporting methods. The
@@ -269,8 +312,11 @@ class Individual(Parameters):
     Attribute filename is assigned when an individual is saved into a 
               population, and is not changed if the individual is saved into
               another population.
+
+    Attribute debug ...
     """
     fitness_names_and_weights = {}
+    debug = False
 
     @property
     def fitness(self):
@@ -293,8 +339,8 @@ class Individual(Parameters):
 
     def evaluate(self):
         """
-        Subclass should use this method to measure the fitness of this set of
-        parameters.
+        Subclass should override this method to measure the fitness of this set
+        of parameters.
 
         This method is executed in a subprocess to escape the GIL.
 
@@ -521,7 +567,8 @@ def evolutionary_algorithm(
         if len(population):
             indv.crossover(random.sample(population, min(2, len(population))))
         if random.random() < mutation_probability:
-            indv.mutate(mutation_percent)
+            indv.mutate_old(mutation_percent)     # Old mutate function
+            # indv.mutate(population)     # DEBUG Experimential new mutate function
         # Start evaluating the individual.  The process pool will call the
         # callback (end_worker_subproc) with the results when it's done.
         subproc_arguments = (indv, profile)
@@ -606,6 +653,67 @@ def _ea_subproc_main(individual, profile):
         return individual, fitness, stats_file.name
     else:
         return individual, fitness
+
+
+class ExperimentMain:
+    """
+    TODO: Explain how to use this class, show example code.
+    """
+    @classmethod
+    def ArgumentParser(cls, description=None, epilog=None):
+        """
+        Argument parser for genetic experiments. 
+
+        Optional Arguments description and epilog are printed in the help message
+            before and after the argument listing.  
+        """
+        if description is None:
+            description = ''    # TODO
+        if epilog is None:
+            epilog = ''         # TODO
+        arg_parser = argparse.ArgumentParser(
+            description = description,
+            epilog = epilog)
+        arg_parser.add_argument('--default_parameters', action='store_true',
+            help='Evaluate the default parameters. Sets Debug flag.')
+        arg_parser.add_argument('--best_parameters',    action='store_true',
+            help='Evaluate the best parameters in the population. Sets Debug flag.')
+        arg_parser.add_argument('--file', type=str,   default='checkpoint',
+            help='What name to save the results by.')
+        arg_parser.add_argument('-p', '--population', type=int, default=100)
+        arg_parser.add_argument('-n', '--processes',  type=int, default=4,
+            help="Number of worker processes to use.")
+        arg_parser.add_argument('-m', '--mutate',     action='store_true')
+        arg_parser.add_argument('--profile',          action='store_true')
+        return arg_parser
+
+    def __init__(self, experiment_class, arg_parser=None):
+        if arg_parser is None:
+            arg_parser = self.ArgumentParser()
+        args = arg_parser.parse_args()
+
+        if args.default_parameters or args.best_parameters:
+            experiment_class.debug = True
+
+            if args.default_parameters:
+                indv = experiment_class()
+                print("Default Parameters")
+            elif args.best_parameters:
+                indv = Population(args.file, 1)[0]
+                print("Best of population")
+
+            print(indv)
+            print()
+            print("Evaluate returned", indv.evaluate())
+        else:
+            population = Population(args.file, args.population)
+            evolutionary_algorithm(
+                experiment_class,
+                population,
+                mutation_probability            = 0.50 if args.mutate else 0.25,
+                mutation_percent                = 0.50 if args.mutate else 0.25,
+                num_processes                   = args.processes,
+                profile                         = args.profile,)
 
 
 def memory_fitness(threshold=2e9, maximum=3e9):

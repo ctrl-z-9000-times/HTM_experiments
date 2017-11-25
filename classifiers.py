@@ -19,7 +19,7 @@ class SDR_Classifier:
         Argument output_type must be one of: 'index', 'bool', 'pdf'
         """
         self.args         = parameters
-        self.input_sdr    = SDR(input_sdr)
+        self.input_sdr    = SDR(input_sdr)      # EEK! This copies the arguments current value instead of saving a reference to argument.
         self.output_shape = tuple(output_shape)
         self.output_type  = output_type
         assert(self.output_type in ('index', 'bool', 'pdf'))

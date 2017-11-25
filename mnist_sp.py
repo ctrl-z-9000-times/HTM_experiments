@@ -120,6 +120,19 @@ def synthesize(seed, diag=False):
     return synth
 
 
+class BWImageEncoder:
+    """Simple grey scale image encoder for MNIST."""
+    def __init__(self, input_space, diag=True):
+        self.output = SDR(tuple(input_space) + (2,))
+
+    def encode(self, image):
+        mean = np.mean(image)
+        on_bits  = image >= mean
+        off_bits = np.logical_not(on_bits)
+        self.output.dense = np.dstack([on_bits, off_bits])
+        return self.output
+
+
 class MNIST_Experiment(genetics.Individual):
     parameters = ['sp', 'cols', 'radii', 'sdrc', 'proximal_segments']
     fitness_names_and_weights = {'score': 1,}
@@ -136,7 +149,7 @@ class MNIST_Experiment(genetics.Individual):
         self.cols       = (1.216e+02, 1.274e+02)
         self.radii      = (3.308e+00, 1.933e+00)
         self.sdrc       = SDRC_Parameters(alpha=1.129e-03)
-        self.proximal_segments = 5
+        self.proximal_segments = None
 
     def evaluate(self):
         # Load data, Setup spatial pooler machine.

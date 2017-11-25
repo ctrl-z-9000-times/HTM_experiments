@@ -705,7 +705,7 @@ class EyeController:
                                 self.motor_angular_velocity_encoder,
                                 self.motor_scale_velocity_encoder,]
         self.motor_sdr = SDR((sum(enc.output.size for enc in self.motor_encoders),))
-        self.reset_gaze_tracking()
+        self.gaze = []
 
     @staticmethod
     def make_control_vectors(num_cv, pos_stddev, angle_stddev, scale_stddev):
@@ -770,7 +770,7 @@ class EyeController:
         # Calculate the new rotation
         eye.orientation = (eye.orientation + dangle) % (2*math.pi)
         # Calculate the new scale
-        new_scale  = np.clip(eye.scale + dscale, self.args.min_scale, self.args.max_scale)
+        new_scale  = np.clip(eye.scale + dscale, eye.args.min_scale, eye.args.max_scale)
         real_ds    = new_scale - eye.scale
         avg_scale  = (new_scale + eye.scale) / 2
         eye.scale = new_scale
@@ -807,7 +807,11 @@ class EyeController:
         Discard any prior gaze tracking.  Call this after forcibly moving eye
         to a new starting position.
         """
-        self.gaze = [tuple(self.position) + (self.orientation, self.scale)]
+        self.gaze = [(
+            self.eye_sensor.position[0],
+            self.eye_sensor.position[1],
+            self.eye_sensor.orientation,
+            self.eye_sensor.scale)]
         # Update motor sensors, set the motor velocity to zero.
         self.control_sdr.zero()
         self.move()
@@ -817,7 +821,7 @@ class EyeController:
         Returns vector of tuples of (position-x, position-y, orientation, scale)
         """
         if diag:
-            im   = PIL.Image.fromarray(self.image)
+            im   = PIL.Image.fromarray(self.eye_sensor.image)
             draw = PIL.ImageDraw.Draw(im)
             width, height = im.size
             # Draw a red line through the centers of each gaze point
@@ -831,7 +835,7 @@ class EyeController:
                 # Find the four corners of the eye's window
                 corners = []
                 for ec_x, ec_y in [(0,0), (0,-1), (-1,-1), (-1,0)]:
-                    corners.append(self.eye_coords[:, ec_x, ec_y])
+                    corners.append(self.eye_sensor.eye_coords[:, ec_x, ec_y])
                 # Convert from list of pairs to index array.
                 corners = np.transpose(corners)
                 # Rotate the corners

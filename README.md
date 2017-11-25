@@ -7,9 +7,9 @@ information about the theory, see: https://numenta.org
 Written by David McDougall, 2017.
 
 ## Installation Notes:
-TODO
-- Install datasets repository, place link to it in this directory...
-- `./setup.py build_ext --inplace`
+1) Clone this repository to local computer.
+2) Install all packages in requirements.txt.
+3) In the HTM_experiments directory, run the command: `$ ./setup.py build_ext --inplace`
 
 ## MNIST Experiment Notes:
 
@@ -18,18 +18,23 @@ split into 60,000 training and 10,000 testing images.  The goal of this
 experiment is to make a program which can look at the labeled training data and
 then correctly identify the unlabeled testing data.
 
-MNIST is used as a fast check for my spatial pooler and synapse manager code.
+MNIST is used as a fast check for the spatial pooler and synapse manager code.
 The command `$ ./mnist_sp.py --default_parameters` should yield a score of at
 least 0.93 out of a best possible score of 1.00.
+
+## Basal Ganglia Experiment Notes:
+See file bg_writeup.odt for a detailed description of how this works.  
+Run with `$ ./bg_test.py --default_parameters`.
 
 ## Eye Experiment Notes:
   TODO
 
 ## Image Dataset Notes:
-The datasets repository is for creating and manipulating datasets of labeled
-images.  It contains a python3 module and a GUI tool, named label_tool.py.  The
-program label_tool.py is used to paint areas of the image with labels for the AI
-to identify.  For help see label_tool.py's in-program help message.
+The datasets directory contains tools for creating and manipulating datasets of
+labeled images.  It contains a python3 module and a GUI tool, named
+label_tool.py.  The program label_tool.py is used to paint areas of the image
+with labels for the AI to identify.  For help see label_tool.py's in-program
+help message.
 
 ## Genetic Algorithm Notes:
 
@@ -48,7 +53,7 @@ These encoders transform inputs such as images into sparse distributed
 representations.  Two requirements for SDRs are that every bit of information
 represents a range of possible values, and that for every input a certain
 fraction of bits activate in the SDR.  The effects of these requirements are
-that each output bit is inaccurate and redundant.  This implementation makes
+that each bit in an SDR is inaccurate and redundant.  This implementation makes
 every output bit receptive to a unique range of inputs.  These ranges are
 uniformly distributed through the inputs space and the widths are the size of
 the input space multiplied by the target sparsity.  This meets both requirements
@@ -109,19 +114,14 @@ fast to compute.  Normal distributions are unique in having both of these
 properties.
 
 ## Reinforcement Learning Notes:
+Many thanks to:  Sungur, 2017.  "HIERARCHICAL TEMPORAL MEMORY BASED AUTONOMOUS 
+AGENT FOR PARTIALLY OBSERVABLE VIDEO GAME ENVIRONMENTS"
 
-Many thanks to:  
-Sungur, 2017.  "HIERARCHICAL TEMPORAL MEMORY BASED AUTONOMOUS AGENT FOR
-PARTIALLY OBSERVABLE VIDEO GAME ENVIRONMENTS"
-
-TODO: explain all of the ways in which my system is different from Sungur's
-system.
-
-
+TODO: Write this section or copy it from the file bg_writeup.odt
 
 ## Cython Notes:
 
-The htm module is written in Cython, a superset of python3 which is compiled
+The sdr module is written in Cython, a superset of python3 which is compiled
 into C code and then to binary python3 extension module.  Cython adds C types to
 python3 code and automatically inserts the interfaces needed to go between C
 types and python3 objects.  Code using these C types bypasses the python3 type

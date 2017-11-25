@@ -16,10 +16,6 @@ System timing:
 7) Striatum learns from (reward + current-EV * future-discount)
 8) Cortex learns.
 9) Motor controls compute, apply, and learn.
-
-The cortex might have a stabilization mechanism which can see a single cycle into the past.
-The striatum operates instantaneously (no time delays).
-The GP has a single cycle delay before learning so that it can asses the TD-Error of its estimate.
 """
 
 # TODO: Consider adding boosting, like SP does.  This could help ensure that
@@ -281,17 +277,17 @@ class BasalGanglia:
             updated_estimated_EV = reward + new_expected_value * self.args.future_discount
             self.td_error        = updated_estimated_EV - self.expected_value
 
+            if updated_estimated_EV > 0:
+                self.prev_d1.learn()
+            elif updated_estimated_EV < 0:
+                self.prev_d2.learn()
+
             if self.td_error > 0:
                 self.prev_gpi.strengthen(self.td_error)
                 self.prev_gpe.weaken(self.td_error)
             elif self.td_error < 0:
                 self.prev_gpe.strengthen(-self.td_error)
                 self.prev_gpi.weaken(-self.td_error)
-
-            if updated_estimated_EV > 0:
-                self.prev_d1.learn()
-            elif updated_estimated_EV < 0:
-                self.prev_d2.learn()
         # Save these things for learning next cycle.
         self.expected_value = new_expected_value
         self.prev_gpi       = self.gpi.copy()
@@ -299,27 +295,23 @@ class BasalGanglia:
         self.prev_d1        = self.d1.copy()
         self.prev_d2        = self.d2.copy()
 
-    def expected_value_func(self, d1, d2):
+    def expected_value_func(self, gpi, gpe):
         """
-        Calculate the expected value. Sungur keeps track of each neurons value,
-        which is updated after learning.  I want to take the ratio of active
-        d1/d2 cells because its simpler and I think that assuming that some
-        cells have values other than their binary activations is not going to
-        work. Striatum cells fire under numerous circumstances, theres no way
-        one value is going to work, and averaging many won't help. arctan2(d1,
-        d2) will bring the expected value to the range [0, pi/2] The expected
-        value needs to gel with the rewards, which are not bounded to any
-        particular range or units.  I could rescale the rewards based on what
-        keeps the expected value in a happy range?  I could use a genetic
-        parameter to scale the reward to a range which works.
+        Calculate the expected value. Use the ratio of active GPi/GPe cells
+        because its simple and I think that assuming that some cells have values
+        other than their binary activations is not going to work. Cells fire
+        under numerous circumstances, theres no way one value is going to work,
+        and averaging many won't help.  Also, I should use a genetic parameter
+        to scale the reward to a range which works.
 
-        fraction = (|D1| - |D2|) / (|D1| + |D2|)        # Range [-1, 1]
-        theta    = fraction * pi/2                      # Range [-pi/2, pi/2]
-        value    = tan(theta) * RewardSensitivity       # Range [-inf, inf]
+        Expected Values range is [-1, 1]
         """
-        d1 = len(d1)
-        d2 = len(d2)
-        new_expected_value = (d1 - d2) / (d1 + d2)
+        gpi = len(gpi)
+        gpe = len(gpe)
+        try:
+            new_expected_value = (gpi - gpe) / (gpi + gpe)
+        except ZeroDivisionError:
+            new_expected_value = 0
         return new_expected_value
 
     def statistics(self):
