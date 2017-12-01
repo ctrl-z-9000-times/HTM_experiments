@@ -22,6 +22,7 @@ class SpatialPoolerParameters(Parameters):
         "sparsity",
         "potential_pool",
         "boosting_alpha",
+        # "init_dist",
     ]
     def __init__(self,
         permanence_inc     = 0.04,
@@ -29,7 +30,9 @@ class SpatialPoolerParameters(Parameters):
         permanence_thresh   = 0.4,
         potential_pool      = 2048,
         sparsity            = 0.02,
-        boosting_alpha      = 0.001,):
+        boosting_alpha      = 0.001,
+        # init_dist           = (0.4/4, 0.4/3),
+        ):
         """
         This class contains the global parameters, which are invariant between
         different cortical regions.  The column dimensions and radii are stored
@@ -41,9 +44,6 @@ class SpatialPoolerParameters(Parameters):
         """
         # Get the parent class to save all these parameters as attributes of the same name.
         kw_args = locals()
-        # Double underscores are magic and come and go as they please.  Filter them all out.
-        dunder  = lambda name: name.startswith('__') and name.endswith('__')
-        kw_args = {k:v for k,v in kw_args.items() if not dunder(k)}
         del kw_args['self']
         super().__init__(**kw_args)
 
@@ -89,7 +89,8 @@ class SpatialPooler:
     def __init__(self, parameters, input_sdr, column_sdr,
         radii=None,
         stability_sample_size=0,
-        multisegment_experiment=None):
+        multisegment_experiment=None,
+        init_dist=None,):
         """
         Argument parameters is an instance of SpatialPoolerParameters.
 
@@ -137,10 +138,10 @@ class SpatialPooler:
                                             permanence_dec    = args.permanence_dec,
                                             permanence_thresh = args.permanence_thresh,)
         if self.topology:
-            r = self.proximal.normally_distributed_connections(args.potential_pool, radii)
+            r = self.proximal.normally_distributed_connections(args.potential_pool, radii, init_dist=init_dist)
             self.inhibition_radii = r
         else:
-            self.proximal.uniformly_distributed_connections(args.potential_pool)
+            self.proximal.uniformly_distributed_connections(args.potential_pool, init_dist=init_dist)
 
         if args.boosting_alpha is not None:
             # Make a dedicated SDR to track column activation frequencies for
@@ -166,6 +167,9 @@ class SpatialPooler:
                 boost = np.log2(self.proximal.outputs.activation_frequency) / np.log2(target_sparsity)
                 boost = np.nan_to_num(boost).reshape(self.proximal.outputs.dimensions)
                 excitment = boost * excitment
+
+            # Break ties randomly
+            excitment = excitment + np.random.uniform(0, .5, size=self.proximal.outputs.dimensions)
 
             self.segment_excitement = excitment
             # Replace the segment dimension with each columns most excited segment.
@@ -212,9 +216,11 @@ class SpatialPooler:
         Make the spatial pooler learn about its current inputs and active columns.
         """
         if self.multisegment:
+            # Learn about regular activations
             self.columns.assign(column_sdr)
             segment_excitement = self.segment_excitement[self.columns.index]
             seg_idx = np.argmax(segment_excitement, axis=-1)
+            # seg_idx = np.random.choice(self.segments_per_cell, size=len(self.columns))
             self.proximal.learn_outputs(input_sdr=input_sdr,
                                         output_sdr=self.columns.index + (seg_idx,))
         else:
@@ -232,7 +238,8 @@ class SpatialPooler:
         the given percent of column overlap between time steps.  Always call
         this between compute and learn!
         """
-        num_active      = (len(self.columns) + len(prior_columns)) / 2
+        # num_active      = (len(self.columns) + len(prior_columns)) / 2
+        num_active      = len(self.columns)
         overlap         = self.columns.overlap(prior_columns)
         stabile_columns = int(round(num_active * overlap))
         target_columns  = int(round(num_active * percent))
@@ -244,6 +251,20 @@ class SpatialPooler:
         eligable_excite   = self.raw_excitment[eligable_columns]
         selected_col_nums = np.argpartition(-eligable_excite, add_columns-1)[:add_columns]
         selected_columns  = eligable_columns[selected_col_nums]
+        selected_index    = np.unravel_index(selected_columns, self.columns.dimensions)
+        # Learn.  Note: selected columns will learn twice.  The previously
+        # active segments learn now, the current most excited segments in the
+        # method SP.learn().
+        # Or learn not at all if theres a bug in my code...
+        # if self.multisegment:
+        #     if hasattr(self, 'prior_segment_excitement'):
+        #         segment_excitement = self.prior_segment_excitement[selected_index]
+        #         seg_idx = np.argmax(segment_excitement, axis=-1)
+        #         self.proximal.learn_outputs(input_sdr=input_sdr,
+        #                                     output_sdr=selected_index + (seg_idx,))
+        #     self.prev_segment_excitement = self.segment_excitement
+        # else:
+        #     1/0
         self.columns.flat_index = np.concatenate([self.columns.flat_index, selected_columns])
 
     def plot_boost_functions(self, beta = 15):

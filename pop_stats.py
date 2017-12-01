@@ -3,8 +3,9 @@
 
 from mnist_sp import *
 from bg_test import *
-from stability_experiment import *
 from eye_sp import *
+from stability_experiment import *
+from eye_sp_tm import *
 
 import genetics
 import argparse
@@ -17,6 +18,7 @@ parser.add_argument('population_size', type=int)
 parser.add_argument('--clone', type=str, default=None)
 parser.add_argument('--clear_fitness', action='store_true')
 parser.add_argument('--individuals',   action='store_true')
+parser.add_argument('--mean',   action='store_true')
 args = parser.parse_args()
 
 sys.argv[0] = args.program_name
@@ -31,6 +33,12 @@ if args.individuals:
         print("Rank %d"%(index+1))
         print(indv)
         print()
+
+if args.mean:
+    mean = type(pop[0]).average(pop)
+    print("Average of population")
+    print(mean)
+    print()
 
 pop[0].pprint_population_statistics(pop)
 

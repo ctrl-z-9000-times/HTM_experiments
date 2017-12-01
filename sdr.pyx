@@ -224,6 +224,7 @@ class SparseDistributedRepresentation:
         """Flats and joins its inputs, assigns the result to its current value."""
         sdrs = tuple(sdrs)
         assert(all(isinstance(s, SDR) for s in sdrs))
+        assert(sum(s.size for s in sdrs) == self.size)
         self._dense      = None
         self._index      = None
         self._flat_index = np.empty(0, dtype=np.int)
@@ -386,7 +387,8 @@ class SparseDistributedRepresentation:
 
         if hasattr(self, 'activation_frequency'):
             af = self.activation_frequency
-            stats += '\tEntropy: %d%%\n'%round(self.entropy()*100)
+            e  = np.nan_to_num(self.entropy())
+            stats += '\tEntropy: %d%%\n'%round(e*100)
             stats += '\tActivation Frequency min/mean/std/max  %-.04g%% / %-.04g%% / %-.04g%% / %-.04g%%\n'%(
                 np.min(af)*100,
                 np.mean(af)*100,
@@ -929,7 +931,7 @@ class SynapseManager:
                     sinks2_inner[inp_idx2_swap] = sinks2_inner[inp_idx2]
                     sinks2_inner[inp_idx2]      = temp_sink2
 
-    def normally_distributed_connections(self, potential_pool, radii):
+    def normally_distributed_connections(self, potential_pool, radii, init_dist=None):
         """
         Makes synapses from inputs to outputs within their local neighborhood.
         The outputs exist on a uniform grid which is stretched over the input
@@ -1052,7 +1054,12 @@ class SynapseManager:
             # Flatten and write to output array.
             working_pool = np.ravel_multi_index(working_pool.T, self.inputs.dimensions)
             working_pool = np.array(working_pool, dtype=np.uint32)
-            initial_permanences = np.random.uniform(size=(len(working_pool),))
+            if init_dist is None:
+                initial_permanences = np.random.uniform(size=(len(working_pool),))
+            else:
+                init_mean, init_std = init_dist
+                initial_permanences = np.random.normal(init_mean, init_std, size=(len(working_pool),))
+                initial_permanences = np.clip(initial_permanences, 0, 1)
             initial_permanences = np.array(initial_permanences, dtype=PERMANENCE)
             self.postsynaptic_sources[column_index] = np.append(self.postsynaptic_sources[column_index], working_pool)
             self.postsynaptic_permanences[column_index] = np.append(self.postsynaptic_permanences[column_index], initial_permanences)
@@ -1064,7 +1071,7 @@ class SynapseManager:
         self.potential_pool_density_3 = potential_pool_density_3 / self.outputs.size
         return inhibition_radii
 
-    def uniformly_distributed_connections(self, potential_pool):
+    def uniformly_distributed_connections(self, potential_pool, init_dist=None):
         """
         Connect every output to potential_pool inputs.
         Directly sets the sources and permanence arrays, no returned value.
@@ -1077,7 +1084,12 @@ class SynapseManager:
         for out_idx in range(self.outputs.size):
             syn_src = np.random.choice(self.inputs.size, potential_pool, replace=False)
             syn_src = np.array(syn_src, dtype=np.uint32)
-            syn_prm = np.random.uniform(size=syn_src.shape)
+            if init_dist is None:
+                syn_prm = np.random.uniform(size=syn_src.shape)
+            else:
+                init_mean, init_std = init_dist
+                syn_prm = np.random.normal(init_mean, init_std, size=syn_src.shape)
+                syn_prm = np.clip(syn_prm, 0, 1)
             syn_prm = np.array(syn_prm, dtype=PERMANENCE)
             self.postsynaptic_sources[out_idx]     = np.append(self.postsynaptic_sources[out_idx], syn_src)
             self.postsynaptic_permanences[out_idx] = np.append(self.postsynaptic_permanences[out_idx], syn_prm)
