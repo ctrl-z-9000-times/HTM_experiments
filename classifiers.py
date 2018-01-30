@@ -19,23 +19,22 @@ class SDR_Classifier:
         Argument output_type must be one of: 'index', 'bool', 'pdf'
         """
         self.args         = parameters
-        self.input_sdr    = SDR(input_sdr)      # EEK! This copies the arguments current value instead of saving a reference to argument.
+        self.input_sdr    = input_sdr
         self.output_shape = tuple(output_shape)
         self.output_type  = output_type
         assert(self.output_type in ('index', 'bool', 'pdf'))
-        # Don't initialize to zero, touch every input+output pair once or twice.
-        self.stats = np.random.uniform(0, 5 * self.args.alpha, size=(self.input_sdr.size,)+self.output_shape)
+        # Don't initialize to zero, touch every input+output pair.
+        self.stats = np.random.uniform(0, 0.5 * self.args.alpha, size=(self.input_sdr.size,)+self.output_shape)
         self.age = 0
 
     def train(self, input_sdr, out):
         """
-        Argument inp is tuple of index arrays, as output from SP's or TP's compute method
-        inp = (ndarray of input space dim 0 indexes, ndarray of input space dim 1 indexes, ...)
+        Argument out ...
         """
         self.input_sdr.assign(input_sdr)
         inp = self.input_sdr.flat_index
         alpha = self.args.alpha
-        self.stats[inp] *= (1-alpha)   # Decay
+        self.stats[inp, :] *= (1-alpha)   # Decay
         # Update.
         if self.output_type == 'index':
             # try:
@@ -59,7 +58,7 @@ class SDR_Classifier:
         Returns probability of each catagory in output space.
         """
         self.input_sdr.assign(input_sdr)
-        pdf = self.stats[self.input_sdr.flat_index]
+        pdf = self.stats[self.input_sdr.flat_index, :]
         if True:
             # Combine multiple probabilities into single pdf. Product, not
             # summation, to combine probabilities of independant events. The

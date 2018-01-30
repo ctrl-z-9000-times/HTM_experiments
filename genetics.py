@@ -29,10 +29,10 @@ class Parameters:
     Class attribute parameters is the list of attributes which make up the 
     mutable parameters, all other attributes are ignored by this class and its
     methods.  The type of these attributes must be one of:
-        1) Floating point number
-        2) Tuple of floating point numbers
-        3) Boolean number
-        4) Instance of Parameters or a child class.
+        1) A floating point, integer, or boolean value,
+        2) A tuple of floating point, integer and boolean values,
+        3) An instance of Parameters or a child class.
+        4) The value None.
     """
     parameters = []
 
@@ -78,6 +78,7 @@ class Parameters:
         parameter     = self.parameters[param_idx]
         return parameter
 
+    # TODO: Rename this to "mutate"
     def mutate_standard(self, percent, population):
         """
         Randomly change some parameters.  The change in value uses the populations
@@ -87,17 +88,37 @@ class Parameters:
             if random.random() > percent:
                 return value
 
+            # Filter out None.
             pop_values = [v for v in pop_values if v is not None]
-            if len(np.unique(pop_values)) < 3:
-                # Use alternative method when diversity is very low.
-                return value * 1.5 ** (random.random()*2-1)
+            # Use alternative methods when diversity is very low.
+            diversity = len(np.unique(pop_values))
+            if isinstance(value, bool):
+                if diversity < 2:
+                    return not value
+            elif diversity < 3:
+                if isinstance(value, int):
+                    if abs(value) < 5:
+                        return value + random.choice([-1, +1])
+                    else:
+                        return int(round(value * (1.5 ** (random.random()*2-1) )))
+                else: # Floating point case.
+                    return value * 1.5 ** (random.random()*2-1)
+
+            std        = np.std(pop_values)
+            std        = std * 1.10                    # Explore more
+            std        = max(std, abs(value) / 1000)   # Minimum deviation
+            new_value  = random.gauss(value, std)
+            if isinstance(value, bool):
+                new_value = bool(round(new_value))
+            elif isinstance(value, int):
+                new_value = int(round(new_value))
             else:
-                std = np.std(pop_values)
-                return float(random.gauss(value, std))
+                new_value = float(new_value)
+            return new_value
 
         for param in self.parameters:
             value      = getattr(self, param)
-            pop_values = [getattr(indiv, param) for indiv in population]
+            pop_values = [getattr(indiv, param, None) for indiv in population]
 
             if value is None:
                 continue # cant mutate.
@@ -115,34 +136,6 @@ class Parameters:
 
             else:   # Mutate a floating point or boolean number.
                 setattr(self, param, mutate_value(value, pop_values))
-
-    def mutate(self, percent):
-        """
-        Randomly change a single parameter by at most the given percent.
-        This uses an exponential mutation rate: (1 + percent) ^ uniform(-1, 1)
-        """
-        param = self._choose_parameter()
-        value = getattr(self, param)
-        if isinstance(value, Parameters):
-            value.mutate(percent)
-        elif isinstance(value, bool):
-            setattr(self, param, not value)
-        else:
-            # modifier = (1 - percent) + 2 * percent * random.random()
-            modifier = (1 + abs(percent)) ** (random.random()*2-1)
-            if isinstance(value, tuple):
-                # Mutate a random element of tuple
-                index    = random.randrange(len(value)) # Pick an element to mutate
-                new_elem = value[index] * modifier      # All elements are treated as floating point
-                # Swap the new element into the tuple.
-                new_value = tuple(new_elem if i==index else elem for i, elem in enumerate(value))
-                setattr(self, param, new_value)
-            else:
-                # Mutate a floating point number
-                new_value = value * modifier
-                if not ((new_value >= 0) == (value >= 0 )):
-                    print(value, new_value, percent)
-                setattr(self, param, new_value)
 
     def crossover(self, parents):
         """
@@ -209,27 +202,49 @@ class Parameters:
     @classmethod
     def average(cls, population, instance=None):
         """
-        Returns an instance of this parameter class whose calues are the
+        Returns an instance of this parameter class whose values are the
         statistical mean of the populations values.
+        Missing values are not set.
         """
         if not population:
             raise ValueError("Population is empty.")
         if instance is None:
             instance = cls()
+
+        def average_of_value(default, pop_values):
+            """Find the average of a single value"""
+            if isinstance(default, Parameters):
+                pop_mean = default.average(pop_values, instance=default)
+            elif isinstance(default, tuple):
+                new_tup = []
+                for index, default_indexed in enumerate(default):
+                    if not all(isinstance(v, tuple) for v in pop_values):
+                        raise ValueError("Type Mismatch, default value is tuple but population's values aren't.")
+                    pop_values_indexed = [v[index] for v in pop_values]
+                    pop_mean_indexed   = average_of_value(default_indexed, pop_values_indexed)
+                    new_tup.append(pop_mean_indexed)
+                pop_mean = tuple(new_tup)
+            elif all(v is None for v in pop_values):
+                pop_mean = None
+            elif isinstance(default, bool):
+                pop_mean = bool(round(np.mean(pop_values)))
+            elif isinstance(default, int):
+                pop_mean = int(round(np.mean(pop_values)))
+            else:   # Floating point case.
+                pop_mean = np.mean(pop_values)
+            return pop_mean
+
         for param in cls.parameters:
             default    = getattr(instance, param)
-            pop_values = [getattr(indiv, param) for indiv in population]
-            if isinstance(default, Parameters):
-                pop_mean = default.average(pop_values, default)
-            else:
-                if all(v is None for v in pop_values):
-                    pop_mean = None
-                elif isinstance(default, bool):
-                    pop_mean = bool(round(np.mean(pop_values)))
-                elif isinstance(default, tuple):
-                    pop_mean = tuple(np.mean(pop_values, axis=0))
-                else:   # Floating point case.
-                    pop_mean = np.mean(pop_values)
+            # Get all values in the population, filter out missing data.
+            no_value   = object()
+            pop_values = [getattr(indiv, param, no_value) for indiv in population]
+            pop_values = [v for v in pop_values if v is not no_value]
+            if not pop_values:
+                # Use default value for new/missing parameters.
+                continue
+            # Find the average of the populations values.
+            pop_mean = average_of_value(default, pop_values)
             setattr(instance, param, pop_mean)
         return instance
 
@@ -302,8 +317,8 @@ class Parameters:
         # Push fitness and resources to either the top of the bottom of the
         # table and then sort alphabetically.
         sort_order = lambda entry: (
-            entry[0].count('fitness.fitness'), # Awalys push this entry to bottom of table.
-            entry[0].count('fitness.'),
+            entry[0].count('results.fitness'), # Awalys push this entry to bottom of table.
+            entry[0].count('results.'),
             entry[0].count('resources.'),
             entry[0])
         entries.sort(key = sort_order)
@@ -349,7 +364,14 @@ class Individual(Parameters):
 
     Attribute debug ...
     """
+    parameters = ['mutation_rate']
     fitness_names_and_weights = {}
+
+    def __init__(self):
+        self.mutation_rate = 0.10
+        self.children      = []
+        self.parents       = []
+        # self.filename      = 
 
     @property
     def fitness(self):
@@ -405,7 +427,7 @@ class Individual(Parameters):
             setattr(self, attr_name, fitness)
 
     def _timeout_handler(self, signum, frame):
-        raise ValueError("Individual exceded time limit (%d minutes)."%self._timeout)
+        raise ValueError("Individual exceded time limit (%d minutes)."%self._time_limit)
 
     @classmethod
     def population_fitness(cls, population):
@@ -433,7 +455,7 @@ class Individual(Parameters):
         """
         table = super().population_statistics(population)
         fitness_stats = cls.population_fitness(population)
-        fitness_stats = {'fitness.'+attr:stat for attr, stat in fitness_stats.items()}
+        fitness_stats = {'results.'+attr:stat for attr, stat in fitness_stats.items()}
         table.update(fitness_stats)
 
         # Resource usage statistics.
@@ -480,55 +502,79 @@ class Individual(Parameters):
             fitness_table = '\n'.join(lines)
         return fitness_table + '\n' + param_table
 
-def _Individual_call_evaluate(self, debug, profile, timeout=None, memory_limit=None):
+def _Individual_call_evaluate(self, debug, profile, time_limit=None, memory_limit=None):
     """
     The multiprocessing library needs this method to be in global scope.  It is
     also why the method needs to return self.
 
-    Argument debug is passed to evaluate.
+    Argument debug is passed to evaluate, is cast to bool().  
+        Debug=True disables both the time and memory limits because diagnostics 
+        typically take more time and memory.
 
     Argument profile ... is boolean, causes this to return the path to a 
              stats_file which is a temporary file containing the binary
-             pstats.Stats() output of the profiler.
+             pstats.Stats() output of the profiler.  Profiling disables debug
+             mode [NOT ANY MORE...].
 
-    Optional Argument timeout is in minutes, will interrupt the evaluate if enabled.
-    Optional Argument memory_limit is in bytes, sets OS limit on resident memory usage.
+    Optional Argument time_limit is in minutes, will interrupt the evaluate if
+                      enabled.  This is not enforced when debug=True.
+    Optional Argument memory_limit is in bytes, sets OS limit on total size of 
+                      address space.  BROKEN.  The resulting interrupt is not
+                      catchable.
 
     Returns either self or (self, profile_stats_filename)
 
+    This sets the following attributes on self.
     Attibute results is the dictionary which evaluate returns.  If evaluate
                      raises an exception this is set to None.
     Attibute resources is a dictionary containing keys "bytes" and "minutes".
     """
-    start_time = time.time()
-    # Setup Profiling
+    debug   = bool(debug)
+    profile = bool(profile)
+    # Setup Profiling.
     if profile:
         pr = cProfile.Profile()
         pr.enable()
-    # Setup memory resource limits
+        # debug = False
+    if debug:
+        memory_limit = None
+        time_limit   = None
+    # Setup memory limit.
     if memory_limit is not None:
-        1/0 # unimplemented.
-    # Setup timeout alarm
-    if timeout is not None:
-        self._timeout = timeout
+        import gc   # Needed for cleanup.
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, hard))
+    # Setup time limit.
+    if time_limit is not None:
+        self._time_limit = time_limit
         signal.signal(signal.SIGALRM, self._timeout_handler)
-        signal.alarm(int(round(timeout * 60)))
+        signal.alarm(int(round(time_limit * 60)))
     # Evaluate fitness
-    inst_copy = copy.deepcopy(self)
+    start_time = time.time()
+    inst_copy  = copy.deepcopy(self)
     try:
         self.results = inst_copy.evaluate(debug)
-    except Exception:
+        self.apply_evaluate_return(self.results)
+    except Exception as x:
+        if isinstance(x, MemoryError) and memory_limit is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+            del inst_copy
+            gc.collect()
         print(str(self))
         traceback.print_exc()
         self.results = None
-    # Disable the timeout alarm
-    if timeout is not None:
+    # Disable the time limit.
+    if time_limit is not None:
         signal.alarm(0)
+    # Disable the memory limit.
+    if memory_limit is not None:
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
     # Measure resource usage
+    elapsed_time = (time.time() - start_time) / 60
     rsc = resource.getrusage(resource.RUSAGE_SELF)
     self.resources = {
         'bytes':   rsc.ru_maxrss * 1024,
-        'minutes': (time.time() - start_time) / 60
+        'minutes': elapsed_time,
     }
     # Collect profiler data and return
     if profile:
@@ -541,6 +587,7 @@ def _Individual_call_evaluate(self, debug, profile, timeout=None, memory_limit=N
 Individual.call_evaluate = _Individual_call_evaluate
 
 
+# REFACTOR: Split the save methods into Individual.save() and Population.save()
 class Population(list):
     """
     Manages groups of Individuals.
@@ -570,14 +617,17 @@ class Population(list):
     Attribute population_size is the maximum number of individuals which this
               population will contain at one time.
     """
-    def __init__(self, population_name, population_size):
+    def __init__(self, population_name, population_size, max_children=None):
         """
         Argument population_name ...
         Argument population_size is the number of Individuals to use.  If there
                  are more individuals than this on file then only the most fit
                  of them are used.  
+        Argument max_children is an integer or None.  None allows any number of
+                 children, default is None.
         """
         super().__init__()
+        self.max_children    = max_children
         self.population_name = population_name
         self.population_size = population_size
         program, program_ext = os.path.splitext(sys.argv[0])
@@ -600,7 +650,8 @@ class Population(list):
             try:
                 with open(file_path, 'rb') as indv_file:
                     indv  = pickle.load(indv_file)
-                self.append( indv )
+                if max_children is None or len(indv.children) < max_children:
+                    self.append( indv )
             except FileNotFoundError:
                 pass
 
@@ -617,52 +668,65 @@ class Population(list):
     def save(self, indv):
         """
         Adds an individual to this population.
-
-        Argument indv is an instance of Individual.  This does NOT check if
-                 the given individual has already been saved, don't save twice.
+        Argument indv is an instance of Individual.
         """
-        # Save individual to file
+        # Save individual to file.
         if not hasattr(indv, 'filename'):
             indv.filename = self.generate_filename()
         file_path         = os.path.join(self.path, indv.filename)
         os.makedirs(self.path, exist_ok=True)
         with open(file_path, 'wb') as indv_file:
             pickle.dump(indv, indv_file)
-        # Update the scoreboard.
-        self.scoreboard.append({'name': indv.filename, 'fitness': indv.fitness})
-        self.scoreboard.sort(reverse=True, key=lambda entry: entry['fitness'])
-        with open(self.scoreboard_filename, 'w') as sbf:
-            writer = csv.DictWriter(sbf, fieldnames=['name', 'fitness'])
-            writer.writeheader()
-            for entry in self.scoreboard:
-                writer.writerow(entry)
-        # Add to internal population
-        self.append(indv)
-        self.sort(reverse=True, key=lambda indv: indv.fitness)
-        while len(self) > self.population_size:
-            self.pop()
+        # Check if individual is already in the population.
+        names = set(entry['name'] for entry in self.scoreboard)
+        if indv.filename in names:
+            # Check if the individual should be removed from the population
+            if len(indv.children) >= self.max_children:
+                self.remove(indv)
+        else:
+            # Add this individual to the scoreboard.
+            self.scoreboard.append({'name': indv.filename, 'fitness': indv.fitness})
+            self.scoreboard.sort(reverse=True, key=lambda entry: entry['fitness'])
+            with open(self.scoreboard_filename, 'w') as sbf:
+                writer = csv.DictWriter(sbf, fieldnames=['name', 'fitness'])
+                writer.writeheader()
+                for entry in self.scoreboard:
+                    writer.writerow(entry)
+            # Add this individual to internal population.
+            self.append(indv)
+            self.sort(reverse=True, key=lambda indv: indv.fitness)
+            while len(self) > self.population_size:
+                self.pop()
 
 
 def evolutionary_algorithm(
     experiment_class,
     population,
-    mutation_percent                = 0.10,
-    num_processes                   = None,
-    profile                         = False,):
+    num_processes       = None,
+    profile             = False,
+    time_limit          = None,
+    memory_limit        = None,):
     """
     Argument experiment_class ... initializer is given no arguments.
     Argument population ...
 
-    Argument mutation_percent ...
-
     Argument num_processes ... defaults to the number of CPU cores present.
     Argument profile ...
+
+    Argument time_limit ... minutes ... Overrides experiment_class.time_limit
+    Argument memory_limit ... bytes ... Overrides experiment_class.memory_limit
     """
     if num_processes is None:
         num_processes = os.cpu_count()
     worker_pool       = mp.Pool(num_processes, maxtasksperchild=1)
     profile_stats     = []
     evals_done        = 0
+    if time_limit is None:
+        time_limit    = getattr(experiment_class, 'time_limit', None)
+    if memory_limit is None:
+        memory_limit  = getattr(experiment_class, 'memory_limit', None)
+    if memory_limit is not None:
+        print('Warning: Reaching the memory limit will crash the process pool, allowing anyways...')
 
     # The following two functions call each other to keep the process pool full
     # at all times.
@@ -671,12 +735,18 @@ def evolutionary_algorithm(
         indv = experiment_class()
         # Crossover and mutate.
         if len(population):
-            indv.crossover(random.sample(population, min(2, len(population))))
-        indv.mutate_standard(mutation_percent, population)
+            parents       = random.sample(population, min(2, len(population)))
+            indv.parents  = [x.filename for x in parents]
+            indv.filename = population.generate_filename()
+            for x in parents:
+                x.children.append(indv.filename)
+                population.save(x)
+            indv.crossover(parents)
+        indv.mutate_standard(indv.mutation_rate, population)
         # Start evaluating the individual.  The process pool will call the
         # callback (end_worker_subproc) with the results when it's done.
         debug = False
-        subproc_arguments = (indv, debug, profile,)
+        subproc_arguments = (indv, debug, profile, time_limit, memory_limit,)
         worker_pool.apply_async(_Individual_call_evaluate, subproc_arguments,
                                 callback = end_worker_subproc)
 
@@ -691,18 +761,18 @@ def evolutionary_algorithm(
         if indv.results is not None:
             indv.apply_evaluate_return(indv.results)
             population.save(indv)
+            # Book keeping
+            nonlocal evals_done
+            evals_done += 1
         # Queue the next job.
         start_worker_subproc()
-        # Book keeping
-        nonlocal evals_done
-        evals_done += 1
 
     try:
         # Kick off the evolutionary algorithm.
         for task in range(num_processes):
             start_worker_subproc()
-            # Stagger the start-ups, which take lots of temporary memory.
-            for second in range(60):
+            # Stagger the start-ups, which can take lots of temporary memory.
+            for second in range(10):
                 time.sleep(1)   # Main thread remains responsive to subprocess communications.
         # Run until interrupted.
         prev_print = 0
@@ -767,20 +837,22 @@ class ExperimentMain:
         arg_parser.add_argument('-p', '--population', type=int, default=100)
         arg_parser.add_argument('-n', '--processes',  type=int, default=4,
             help="Number of worker processes to use.")
-        arg_parser.add_argument('-m', '--mutate',     type=float, default=0.05,
-            help='What fraction of parameters are mutated at conception.')
+        arg_parser.add_argument('--max_children',     type=int, default=20,)
         arg_parser.add_argument('--profile',          action='store_true')
+        arg_parser.add_argument('--time_limit',       type=float)
+        arg_parser.add_argument('--memory_limit',     type=float)
         return arg_parser
 
-    def __init__(self, experiment_class, arg_parser=None):
+    def __init__(self, experiment_class, args=None):
         """
         Argument experiment_class is an instance of Individual.
-        Optional Argument arg_parser ... always  use ExperimentMain.ArgumentParser
+        Optional Argument args ... always  use ExperimentMain.ArgumentParser
             to create this argument, then add/modify arguments as needed.
         """
-        if arg_parser is None:
-            arg_parser = self.ArgumentParser()
-        args = arg_parser.parse_args()
+        if args is None:
+            args = self.ArgumentParser()
+        if isinstance(args, argparse.ArgumentParser):
+            args = args.parse_args()
 
         if args.default_parameters or args.best_parameters or args.mean_parameters:
             if args.default_parameters:
@@ -790,7 +862,7 @@ class ExperimentMain:
                 indv = Population(args.file, 1)[0]
                 print("Best of population")
             elif args.mean_parameters:
-                population = Population(args.file, args.population)
+                population = Population(args.file, args.population, args.max_children)
                 indv = experiment_class.average(population)
                 print("Average of population")
 
@@ -803,16 +875,21 @@ class ExperimentMain:
                 stats.sort_stats('time')
                 stats.print_stats()
                 os.remove(prof)     # Clean up
-            print("Evaluate returned", indv.results)
+            if indv.results is not None:
+                results = sorted(list(indv.results.items()), key=lambda r: r[0])
+                results = '\n'.join('\t%s:\t%s'%(f,str(v)) for f,v in results)
+                print("Results:\n", results)
+                print("Fitness:", indv.fitness)
             print("Resources used", indv.resources)
         else:
-            population = Population(args.file, args.population)
+            population = Population(args.file, args.population, args.max_children)
             evolutionary_algorithm(
                 experiment_class,
                 population,
-                mutation_percent                = args.mutate,
                 num_processes                   = args.processes,
-                profile                         = args.profile,)
+                profile                         = args.profile,
+                time_limit                      = args.time_limit,
+                memory_limit                    = args.memory_limit,)
 
 
 def memory_fitness(threshold=2e9, maximum=3e9):
@@ -830,7 +907,10 @@ def memory_fitness(threshold=2e9, maximum=3e9):
     rsc = resource.getrusage(resource.RUSAGE_SELF)
     size = rsc.ru_maxrss * 1024
     fit  = (size - threshold) / (maximum - threshold)
-    if fit > 1:
+    if fit > 1 and False:
+        # Don't raise an exception because this is measured after collecting all
+        # of the data.  If there was a way to raise a OS exception when it tried
+        # to allocate the memory...
         raise ValueError("Individual exceded memory limit (size %d bytes, maximum %d)."%(size, maximum))
     return max(0, fit)
 
@@ -841,35 +921,24 @@ class speed_fitness:
     1.  timer = speed_fitness(45 minutes, 90 minutes)
     2.  Do_work_which_may_take_a_long_time( instance_of_individual )
     3.  return { 'speed_fitness': timer.done() }
-    Alternatively:
-    3.  return { 'speed_fitness': timer.elapsed_time }
-    4.  IndividualClass.fitness_names_and_weights['speed_fitness'] = 0
     """
     def __init__(self, threshold, maximum):
         """
         Arguments threshold, maximum ... units are minutes.
                   Raises a ValueError if the maximum time limit is exceded.
         """
-        assert(signal.alarm(0) == 0) # Check that no alarm was already set.
         self.threshold   = threshold
         self.maximum     = maximum
         self.start_time  = time.time()
-        signal.signal(signal.SIGALRM, self.handler)
-        signal.alarm(int(round(maximum * 60)))
-
-    def handler(self, signum, frame):
-        raise ValueError("Individual exceded time limit (%d minutes)."%self.maximum)
 
     def done(self):
         """
         Returned value is in range [0, 1], where 0 indicates that the speed is 
         sub-threshold and 1 is the maximum allowable time.
         """
-        signal.alarm(0)          # Disable the alarm
         return max(0, (self.elapsed_time - self.threshold) / (self.maximum - self.threshold))
 
     @property
     def elapsed_time(self):
         """Minutes since this objects instantiation."""
         return (time.time() - self.start_time) / 60
-

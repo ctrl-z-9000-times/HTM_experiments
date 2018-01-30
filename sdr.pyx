@@ -1,13 +1,17 @@
 # Written by David McDougall, 2017
 # cython: language_level=3
 # cython: profile=True
+DEF DEBUG = False
+debug = DEBUG
 
 import numpy as np
 cimport numpy as np
 cimport cython
+import scipy.stats
 import math
 from fractions import Fraction
 import copy
+import random
 
 def _choose(n, r):
     """Number of ways to choose 'r' unique elements from set of 'n' elements."""
@@ -16,7 +20,7 @@ def _choose(n, r):
 
 def _binary_entropy(p):
     p_ = (1 - p)
-    s = -p*np.log2(p) -p_*np.log2(p_)
+    s  = -p*np.log2(p) -p_*np.log2(p_)
     return np.mean(np.nan_to_num(s))
 
 
@@ -24,18 +28,29 @@ class SparseDistributedRepresentation:
     """
     This class represents both the specification and the momentary value of a
     Sparse Distributed Representation.  Classes initialized with SDRs can expect
-    the SDRs values to change.
+    the SDRs values to change.  An SDR represents the state of a group of
+    neurons.  An SDR consists of a value (unsigned 8-bit) for each neuron.
 
     Attribute dimensions is a tuple of integers, read only.
-    Attribute size is the total number of bits in SDR, read only.
+    Attribute size is the total number of neurons in SDR, read only.
 
-    The following three attributes hold the current value of the SDR, and are 
+    The following four attributes hold the current value of the SDR, and are
     read/writable.  Values assigned to one attribute are converted to the other
-    formats when needed.
-    Attribute dense ... ndarray, shape=self.dimensions, dtype=np.int8
-    Attribute index ... tuple of ndarray, ndarray.shape=(num-active-bits), dtype=np.int
-    Attribute flat_index ... ndarray, shape=(all-one-dim,), dtype=np.int
+    formats as needed.  Assignments to dense, index, and flat_index will over
+    write each other, only the most recent assignment to these three attributes
+    is kept.
+
+    Attribute dense ... np.ndarray, shape=self.dimensions, dtype=np.uint8
+
+    Attribute index ... tuple of np.ndarray, len(sdr.index) == len(sdr.dimensions)
+              sdr.index[dim].shape=(num-active-bits), dtype=np.int
+
+    Attribute flat_index ... np.ndarray, shape=(all-one-dim,), dtype=np.int
               The flat index is the index into the flattened SDR.
+
+    Attribute nz_values ... np.ndarray, shape=(len(sdr),), dtype=np.uint8
+              Contains all non-zero values in the SDR, in same order as 
+              sdr.index and sdr.flat_index.  Defaults to all ones.
     """
     def __init__(self, specification,
         activation_frequency_alpha=None,
@@ -80,8 +95,7 @@ class SparseDistributedRepresentation:
 
         if bool(activation_frequency_alpha):
             self.activation_frequency_alpha = activation_frequency_alpha
-            # TODO: Why flat? Dimensions were requested and are expected!
-            self.activation_frequency       = np.zeros(self.size, dtype=np.float32)
+            self.activation_frequency       = np.zeros(self.dimensions, dtype=np.float32)
             self._callbacks.append(type(self)._track_activation_frequency)
 
         if bool(average_overlap_alpha):
@@ -93,22 +107,24 @@ class SparseDistributedRepresentation:
     @property
     def dense(self):
         if self._dense is None:
+            nz_values = self.nz_values
             if self._flat_index is not None:
-                self._dense = np.zeros(self.size, dtype=np.int8)
-                self._dense[self._flat_index] = 1
+                self._dense = np.zeros(self.size, dtype=np.uint8)
+                self._dense[self._flat_index] = nz_values
                 self._dense.shape = self.dimensions
             elif self._index is not None:
-                self._dense = np.zeros(self.dimensions, dtype=np.int8)
-                self._dense[self._index] = 1
+                self._dense = np.zeros(self.dimensions, dtype=np.uint8)
+                self._dense[self.index] = nz_values
         return self._dense
     @dense.setter
     def dense(self, value):
         assert(isinstance(value, np.ndarray))
         value.shape      = self.dimensions
-        value.dtype      = np.int8
+        value.dtype      = np.uint8
         self._dense      = value
         self._index      = None
         self._flat_index = None
+        self._nz_values  = None
         self._handle_callbacks()
 
     @property
@@ -124,9 +140,11 @@ class SparseDistributedRepresentation:
         value = tuple(value)
         assert(len(value) == len(self.dimensions))
         assert(all(idx.shape == value[0].shape for idx in value))
+        assert(all(len(idx.shape) == 1 for idx in value))
         self._dense      = None
         self._index      = value
         self._flat_index = None
+        self._nz_values  = None
         self._handle_callbacks()
 
     @property
@@ -140,10 +158,28 @@ class SparseDistributedRepresentation:
     @flat_index.setter
     def flat_index(self, value):
         assert(len(value.shape) == 1)
+        self._dense      = None
+        self._index      = None
         self._flat_index = value
-        self._index = None
-        self._dense = None
+        self._nz_values  = None
         self._handle_callbacks()
+
+    @property
+    def nz_values(self):
+        if self._nz_values is None:
+            dense = self._dense
+            if dense is not None:
+                dense.shape = -1
+                self._nz_values  = dense[self.flat_index]
+                dense.shape = self.dimensions
+            else:
+                self._nz_values = np.ones(len(self), dtype=np.uint8)
+        return self._nz_values
+    @nz_values.setter
+    def nz_values(self, value):
+        self._nz_values       = value
+        self._nz_values.shape = (len(self),)
+        self._nz_values.dtype = np.uint8
 
     def assign(self, sdr):
         """
@@ -159,6 +195,7 @@ class SparseDistributedRepresentation:
         self._dense      = None
         self._index      = None
         self._flat_index = None
+        self._nz_values  = None
 
         if isinstance(sdr, SDR):
             assert(self.dimensions == sdr.dimensions)
@@ -168,10 +205,12 @@ class SparseDistributedRepresentation:
                 self._index = sdr._index
             if sdr._flat_index is not None:
                 self._flat_index = sdr._flat_index
+            if sdr._nz_values is not None:
+                self._nz_values = sdr._nz_values
             self._handle_callbacks()
 
         elif isinstance(sdr, np.ndarray):
-            if sdr.dtype in (np.int8, np.uint8, bool) and self.size == np.product(sdr.shape):
+            if sdr.dtype == np.uint8 and self.size == np.product(sdr.shape):
                 self.dense = sdr
             elif len(sdr.shape) == 1:
                 self.flat_index = sdr
@@ -187,8 +226,9 @@ class SparseDistributedRepresentation:
 
     def _track_activation_frequency(self):
         alpha = self.activation_frequency_alpha
-        self.activation_frequency *= (1 - alpha)             # Decay with time
-        self.activation_frequency[self.flat_index] += alpha  # Incorperate this sample
+        # Decay with time and incorperate this sample.
+        self.activation_frequency             *= (1 - alpha)
+        self.activation_frequency[self.index] += alpha * self.nz_values
 
     def _track_average_overlap(self):
         alpha                = self.average_overlap_alpha
@@ -201,9 +241,11 @@ class SparseDistributedRepresentation:
             flat_index  = np.ravel_multi_index(self._index, self.dimensions)
             flat_index  = np.setdiff1d(flat_index, self._dead_cells)
             self._index = np.unravel_index(flat_index, self.dimensions)
+            assert(self._nz_values is None)
 
         if self._flat_index is not None:
             self._flat_index = np.setdiff1d(self._flat_index, self._dead_cells)
+            assert(self._nz_values is None)
 
         if self._dense is not None:
             self._dense.shape = -1
@@ -219,6 +261,7 @@ class SparseDistributedRepresentation:
         self._dense      = None
         self._index      = None
         self._flat_index = np.empty(0, dtype=np.int)
+        self._nz_values  = None
 
     def assign_flat_concatenate(self, sdrs):
         """Flats and joins its inputs, assigns the result to its current value."""
@@ -228,9 +271,11 @@ class SparseDistributedRepresentation:
         self._dense      = None
         self._index      = None
         self._flat_index = np.empty(0, dtype=np.int)
+        self._nz_values  = np.empty(0, dtype=np.uint8)
         offset = 0
         for sdr in sdrs:
             self._flat_index = np.concatenate([self._flat_index, sdr.flat_index + offset])
+            self._nz_values  = np.concatenate([self._nz_values, sdr.nz_values])
             offset += sdr.size
         self._handle_callbacks()
 
@@ -260,11 +305,15 @@ class SparseDistributedRepresentation:
 
         Returns a number in the range [0, 1]
         """
-        other = SDR(self)
+        other = SDR(self.dimensions)
         other.assign(other_sdr)
-        overlap_bits = np.count_nonzero(np.logical_and(self.dense, other.dense))
-        average_bits = (len(self) + len(other)) / 2
-        return overlap_bits / average_bits
+        total_bits = np.sum(self.nz_values) + np.sum(other.nz_values)
+        if total_bits == 0:
+            return 0
+        diff_bits  = np.array(self.dense, dtype=np.int)
+        diff_bits -= other.dense
+        diff_bits  = np.sum(np.abs(diff_bits))
+        return (total_bits - diff_bits) / total_bits
 
     def false_positive_rate(self, active_sample_size, overlap_threshold):
         """
@@ -286,7 +335,10 @@ class SparseDistributedRepresentation:
             num_active_bits = int(round(np.mean(self.activation_frequency) * self.size))
         else:
             num_active_bits = len(self)
-        assert(active_sample_size <= num_active_bits) # Can't sample more bits than are active.
+        # Can't sample more bits than are active.
+        if active_sample_size > num_active_bits:
+            return float('nan')
+
         num_inactive_bits = self.size - num_active_bits
         # Overlap set size is number of possible values for this SDR which
         # this segment could falsely detect.
@@ -323,8 +375,12 @@ class SparseDistributedRepresentation:
             num_active_bits = int(round(np.mean(self.activation_frequency) * self.size))
         else:
             num_active_bits = len(self)
-        assert(active_sample_size >= overlap_threshold) # Otherwise the segment would never activate.
-        assert(active_sample_size <= num_active_bits) # Can't sample more bits than are active.
+        if active_sample_size < overlap_threshold:
+            # The segment will never activate.
+            return 1.
+        # Can't sample more bits than are active.
+        if active_sample_size > num_active_bits:
+            return float('nan')
         assert(0 <= missing_activations <= 1) # missing_activations is the fraction of all activations.
         missing_activations = int(round(missing_activations * num_active_bits))
         # Count how many ways there are to corrupt this SDR such that it would
@@ -360,14 +416,29 @@ class SparseDistributedRepresentation:
         return e
 
     def add_noise(self, percent):
-        """Returns a copy of this SDR with the given percent of active bits moved."""
-        assert(False) # Unimplemented.
-        noisy     = SDR(self)
-        # flip_off  = random.sample(on_bits, flip_bits)
-        # flip_on   = random.sample(off_bits, flip_bits)
-        # noisy.dense[list(zip(*flip_off))] = False
-        # noisy.dense[list(zip(*flip_on))]  = True
-        return noisy
+        """
+        Moves the given percent of active bits to a new location.
+        TODO: This doesn't preserve the values, changed values become all ones.
+        """
+        cdef int flip_bits, x
+        num_bits    = len(self)
+        flip_bits   = int(round(len(self) * percent))
+        flat        = self.flat_index
+        self._index = None
+        self._dense = None
+        # Turn off bits.
+        off_bits_idx     = np.random.choice(num_bits, size=flip_bits, replace=False)
+        off_bits         = self._flat_index[off_bits_idx]
+        self._flat_index = np.delete(self._flat_index, off_bits_idx)
+        # Turn on bits
+        on_bits = set(self._flat_index)
+        for x in range(flip_bits):
+            while True:
+                bit = np.random.choice(self.size)
+                if bit not in on_bits:
+                    break
+            on_bits.add(bit)
+        self._flat_index = np.array(list(on_bits), dtype=np.int64)
 
     def kill_cells(self, percent):
         """
@@ -402,11 +473,53 @@ class SparseDistributedRepresentation:
 SDR = SparseDistributedRepresentation
 
 
-DEF DEBUG = True
+# TODO: This should allow for topology???
+class SDR_Subsample(SDR):
+    """
+    Makes an SDR smaller by randomly removing bits.  SDR subsamples are read
+    only.
+    """
+    def __init__(self, sdr, subsample):
+        1/0 # unimplemented
+        self.sdr = sdr
+        sdr._callbacks.append(self._clear)
+
+    def _clear(self):
+        self._dense      = None
+        self._index      = None
+        self._flat_index = None
+        self._nz_values  = None
+
+    @property
+    def dense(self):
+        1/0 # unimplemented.
+        return self._dense
+    
+    @property
+    def index(self):
+        1/0 # unimplemented.
+        return self._index
+
+    @property
+    def flat_index(self):
+        1/0 # unimplemented.
+        return self._flat_index
+    
+    @property
+    def nz_values(self):
+        1/0 # unimplemented.
+        return self._nz_values
+    
+
+
 
 ctypedef np.float32_t PERMANENCE_t  # For Cython's compile time type system.
 PERMANENCE = np.float32             # For Python3's run time type system.
 
+
+# TODO: Move all synapses making stuff into the init and store in class instance
+#       This will make it easier to add/manage synapses at run time.
+#       (init_dist + radii)
 class SynapseManager:
     """
     This class models NMDA Receptor synapses.
@@ -428,19 +541,13 @@ class SynapseManager:
         potential and actual input connections to each output location, and are
         refered to as the 'potential_pool'.
 
-    Attributes presynaptic_sinks
+    Attributes presynaptic_sinks, presynaptic_sinks_sizes
         presynaptic_sinks[input-index] = 1D array of connected output indecies.
         The sinks table is associates each input (presynapse) with its outputs
-        (postsynapses), allowing for fast feed forward calculations.
-
-    Attribute presynaptic_partitions
-        Each entry in presynaptic_sinks is partitioned into connected and
-        disconnected synapses.  This allows for fast feed forward calculations.
-        In pseudocode:
-            partition             = presynaptic_partitions[input-index]
-            synapse_outputs       = presynaptic_sinks[input-index]
-            connected_synapses    = synapse_outputs[0 : partition]
-            disconnected_synapses = synapse_outputs[partition : ]
+        (postsynapses), allowing for fast feed forward calculations.  
+        presynaptic_sinks_sizes[input-index] = np.uint32  This is the logical 
+        size of the presynaptic_sinks entry.  The presynaptic_sinks are 
+        allocated with extra space to facilitate adding and removing synapses.
 
     Since postsynaptic_sources and presynaptic_sinks are arrays of arrays, two
     indecies are needed to go back and forth between them.  Attributes
@@ -449,7 +556,8 @@ class SynapseManager:
 
     Attribute postsynaptic_source_side_index
         This table runs parallel to the postsynaptic_sources table and contains
-        the second index into the presynaptic_sinks table.  Values in this table
+        the second index into the presynaptic_sinks table.  Entries in this
+        table are only valid if the synapse is connected.  Values in this table
         can be derived from the following pseudocode:
             output_index         = 1234
             potential_pool_index = 66
@@ -467,6 +575,10 @@ class SynapseManager:
             potential_index = postsynaptic_sources[output_index].index(input_index)
             presynaptic_sink_side_index[input_index][sink_number] = potential_index
 
+    Attribute presynaptic_permanences contain the synapse permanences, indexed
+              from the input side.  This attibute is only available if the
+              SynapseManager was created with weighted = True.
+
     Data types:
         Network Size Assumptions:
             self.num_inputs  <= 2^32, input space is uint32 addressable.
@@ -479,7 +591,7 @@ class SynapseManager:
 
         presynaptic_sinks.dtype == np.uint32, index into output space.
 
-        presynaptic_partitions.dtype == np.uint32, maximum number of outputs
+        presynaptic_sinks_sizes.dtype == np.uint32, maximum number of outputs
             which an input could connect to at one time, size of output space.
 
         presynaptic_sink_side_index.dtype == np.uint32, maximum number of inputs
@@ -494,34 +606,47 @@ class SynapseManager:
         on the validity of the internal data structures and corruption typically
         causes out of bounds array access errors.
     """
-    def __init__(self, input_sdr, output_sdr, permanence_thresh,
+    def __init__(self, input_sdr, output_sdr, radii, init_dist, permanence_thresh,
         permanence_inc = 0,
-        permanence_dec = 0,):
+        permanence_dec = 0,
+        # add_synapses   = None,
+        weighted       = False,):
         """
         Argument input_sdr is the presynaptic input activations.
         Argument output_sdr is the postsynaptic segment sites.
 
+        Argument init_dist is (mean, std) of permanence value random initial distribution.
         Argument permanence_thresh ...
         Optional Argument permanence_inc ...
         Optional Argument permanence_dec ...
+
+        Optional Argument weighted is a bool.
+            The compute_weighted method uses the synapse permancence as a
+            connection strength, instead of as a boolean connection.
+            ...  synapse strength to the excitement accumulator instead of incrementing it.
+            The  learn method still modifies the permanence using hebbian
+            learning.
+
         """
         assert(isinstance(input_sdr, SDR))
         assert(isinstance(output_sdr, SDR))
         self.inputs            = input_sdr
         self.outputs           = output_sdr
+        self.radii             = tuple(radii) if radii is not None else None
+        self.init_dist         = tuple(PERMANENCE(z) for z in init_dist)
         self.permanence_inc    = PERMANENCE(permanence_inc)
         self.permanence_dec    = PERMANENCE(permanence_dec)
         self.permanence_thresh = PERMANENCE(permanence_thresh)
+        self.weighted          = bool(weighted)
 
         assert(self.inputs.size  <= 2**32)   # self.postsynaptic_sources is a uint32 index into input space
         assert(self.outputs.size <= 2**32)   # self.presynaptic_sinks is a uint32 index into output space
+        if self.weighted:
+            assert(self.permanence_thresh == 0)
 
         self.postsynaptic_sources       = np.empty(self.outputs.size, dtype=object)
         self.postsynaptic_permanences   = np.empty(self.outputs.size, dtype=object)
         for idx in range(self.outputs.size):
-            # Note: np.empty(dtype=object) fills array with None.  It's faster
-            # to initialize the tables have all valid (if empty) entries than to
-            # check for None's at every turn.
             self.postsynaptic_sources[idx]     = np.empty((0,), dtype=np.uint32)
             self.postsynaptic_permanences[idx] = np.empty((0,), dtype=PERMANENCE)
         self.rebuild_indexes()  # Initializes sinks index et al.
@@ -540,37 +665,78 @@ class SynapseManager:
         Returns the excitement ... shape is output_sdr.dimensions
         """
         self.inputs.assign(input_sdr)
+        cdef:
+            # np.ndarray[np.uint8_t]   inps        = self.inputs.dense.reshape(-1)
+            np.uint8_t [:]  inps        = self.inputs.dense.reshape(-1)
+            # np.ndarray[np.uint32_t]  excitement  = np.zeros(self.outputs.size, dtype=np.uint32)
+            np.uint32_t [:]  excitement  = np.zeros(self.outputs.size, dtype=np.uint32)
+            # np.ndarray[dtype=object] sinks_table = self.presynaptic_sinks
+            object [:] sinks_table = self.presynaptic_sinks
+            np.ndarray[np.uint32_t]  sinks_entry
+            # np.uint32_t [:]  sinks_entry
+            # np.ndarray[np.uint32_t]  sink_sizes  = self.presynaptic_sinks_sizes
+            unsigned int [:]  sink_sizes  = self.presynaptic_sinks_sizes
+            # np.ndarray[np.int_t]     active_inputs = self.inputs.flat_index
+            np.uint32_t inp_idx, out_idx
+            np.uint8_t inp_value
+            int iter1, iter2
 
-        # Cython assumes ndim=1 by default.
-        cdef np.ndarray[np.int8_t]     inps        = self.inputs.dense.reshape(-1)
-        cdef np.ndarray[np.uint32_t]   excitement  = np.zeros(self.outputs.size, dtype=np.uint32)
-        cdef np.ndarray[dtype=object]  sinks_table = self.presynaptic_sinks
-        cdef np.ndarray[np.uint32_t]   sinks_entry
-        cdef np.ndarray[np.uint32_t]   sink_sizes  = self.presynaptic_partitions
-        # cdef np.ndarray[np.int_t]      active_inputs = np.nonzero(self.input_activity)[0]
-        cdef np.uint32_t inp_idx, out_idx
-        cdef int iter1, iter2
-
-        # TODO: Consider rolling the nonzero opperation directly into this loop
-        #       Make sure it runs faster too, although currently is makes input dense and THEN takes the nonzero...
-        # for iter1 in range(active_inputs.shape[0]):
-        #     inp_idx = active_inputs[iter1]
         for inp_idx in range(inps.shape[0]):
-            if inps[inp_idx] == 0:
+            inp_value = inps[inp_idx]
+            if inp_value == 0:
                 continue
             IF DEBUG:   # Safe cast (type checks and throws exceptions if needed)
-                sinks_entry = <np.ndarray[np.uint32_t, ndim=1]?> sinks_table[inp_idx]
+                sinks_entry = <np.ndarray[np.uint32_t]?> sinks_table[inp_idx]
             ELSE:       # Unsafe Cast
-                sinks_entry = <np.ndarray[np.uint32_t, ndim=1]> sinks_table[inp_idx]
+                sinks_entry = <np.ndarray[np.uint32_t]> sinks_table[inp_idx]
             for iter2 in range(sink_sizes[inp_idx]):
                 out_idx = sinks_entry[iter2]
-                excitement[out_idx] += 1
+                excitement[out_idx] += inp_value
+        return np.asarray(excitement).reshape(self.outputs.dimensions)
+
+    # TODO: I really want to call this compute_linear...
+    @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
+    @cython.wraparound(DEBUG)  # Turns off negative index wrapping for entire function.
+    def compute_weighted(self, input_sdr=None):
+        """
+        Applies presynaptic activity to synapses, returns the postsynaptic
+        excitment.
+
+        Argument input_sdr ... is assigned to this classes internal inputs SDR.
+                 If not given this uses the current value of its inputs SDR,
+                 which this synapse manager was initialized with.
+
+        Returns the excitement ... shape is output_sdr.dimensions
+        """
+        self.inputs.assign(input_sdr)
+
+        cdef:
+            np.ndarray[np.int_t]      active_inputs = self.inputs.flat_index
+            np.ndarray[dtype=object]  sinks_table   = self.presynaptic_sinks
+            np.ndarray[np.uint32_t]   sinks_entry
+            np.ndarray[dtype=object]  perms_table   = self.presynaptic_permanences
+            np.ndarray[np.uint32_t]   sink_sizes    = self.presynaptic_sinks_sizes
+            np.ndarray[PERMANENCE_t]  perms_entry
+            np.ndarray[np.float32_t]  excitement    = np.zeros(self.outputs.size, dtype=np.float32)
+            np.uint32_t inp_idx1, inp_idx2, out_idx
+            int iter1, iter2
+
+        for iter1 in range(active_inputs.shape[0]):
+            inp_idx1 = active_inputs[iter1]
+            IF DEBUG:   # Safe cast (type checks and throws exceptions if needed)
+                sinks_entry = <np.ndarray[np.uint32_t]?>  sinks_table[inp_idx1]
+                perms_entry = <np.ndarray[PERMANENCE_t]?> perms_table[inp_idx1]
+            ELSE:       # Unsafe Cast
+                sinks_entry = <np.ndarray[np.uint32_t]>  sinks_table[inp_idx1]
+                perms_entry = <np.ndarray[PERMANENCE_t]> perms_table[inp_idx1]
+            for inp_idx2 in range(sink_sizes[inp_idx1]):
+                out_idx = sinks_entry[inp_idx2]
+                excitement[out_idx] += perms_entry[inp_idx2]
         return excitement.reshape(self.outputs.dimensions)
 
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(DEBUG)  # Turns off negative index wrapping for entire function.
-    def learn_outputs(self, input_sdr=None, output_sdr=None,
-        traces=None,
+    def learn(self, input_sdr=None, output_sdr=None,
         permanence_inc = None,
         permanence_dec = None,):
         """
@@ -579,7 +745,6 @@ class SynapseManager:
 
         This method accepts one of the following arguments:
         Argument output_sdr ...
-        Argument traces ... dense dtype=PERMANENCE
 
         Optional Arguments permanence_inc and permanence_dec take precedence over
                            any value passed to this classes initialize method.
@@ -588,356 +753,281 @@ class SynapseManager:
         self.outputs.assign(output_sdr)
         cdef:
             # Data tables
-            np.ndarray[dtype=object] sources          = self.postsynaptic_sources
-            np.ndarray[dtype=object] sources2         = self.postsynaptic_source_side_index
-            np.ndarray[dtype=object] permanences      = self.postsynaptic_permanences
-            np.ndarray[dtype=object] sinks            = self.presynaptic_sinks
-            np.ndarray[dtype=object] sinks2           = self.presynaptic_sink_side_index
-            np.ndarray[np.uint32_t]  sink_partitions  = self.presynaptic_partitions
-            np.ndarray[np.int_t]     output_activity  = self.outputs.flat_index
-            np.ndarray[PERMANENCE_t] traces_          = traces
-            np.ndarray[np.int8_t]    input_activity   = self.inputs.dense.reshape(-1)
+            object [:]       sources          = self.postsynaptic_sources
+            object [:]       sources2         = self.postsynaptic_source_side_index
+            object [:]       permanences      = self.postsynaptic_permanences
+            object [:]       sinks            = self.presynaptic_sinks
+            object [:]       sinks2           = self.presynaptic_sink_side_index
+            object [:]       presyn_perms     = getattr(self, 'presynaptic_permanences', None)
+            np.uint32_t  [:] sinks_sizes      = self.presynaptic_sinks_sizes
+            np.int_t     [:] output_activity  = self.outputs.flat_index
+            np.uint8_t   [:] output_values    = self.outputs.nz_values
+            np.uint8_t   [:] input_activity   = self.inputs.dense.reshape(-1)
+            # np.int_t     [:] input_flat_index = self.inputs.flat_index
+            # np.int64_t   [:] input_index_inner
+            # PERMANENCE_t [:] presyn_perms_inner
+            # np.int64_t   [:] candidate_source_nums
+            # np.int64_t   [:] candidate_sources
+
+            # np.float64_t [:]    radii = np.array(self.radii, dtype=np.float64) if self.radii is not None else None
+            # np.float64_t [:, :] output_locations = getattr(self, 'output_locations', None)
+            # bint topology = self.radii is not None and len(self.radii)
 
             # Inner array pointers
             np.ndarray[np.uint32_t]  sources_inner
             np.ndarray[np.uint32_t]  sources2_inner
-            np.ndarray[np.uint32_t]  sources2_inner_swap
+            np.ndarray[np.uint32_t]  sources2_inner_move
             np.ndarray[PERMANENCE_t] perms_inner
             np.ndarray[np.uint32_t]  sinks_inner
             np.ndarray[np.uint32_t]  sinks2_inner
 
             # Indexes and locals
-            int out_loop_size
-            np.uint32_t out_iter, out_idx1, out_idx2
-            np.uint32_t inp_idx1, inp_idx2, inp_idx2_swap
+            np.uint32_t out_iter, out_idx1, out_idx2, out_idx_1_move, out_idx_2_move
+            np.uint32_t inp_idx1, inp_idx2 #, inp_idx2_move
+            np.uint32_t sink_size
+            # int disconnected_len, disconnected_index, _add_synapses = add_synapses
+            # np.ndarray[np.uint32_t] disconnected = np.full(_add_synapses, -1, dtype=np.uint32)
+            np.uint8_t input_value, output_value
             PERMANENCE_t perm_value
+            PERMANENCE_t base_inc, base_dec
             PERMANENCE_t inc, dec, thresh = self.permanence_thresh
-            PERMANENCE_t trace
-            PERMANENCE_t weighted_inc
-            PERMANENCE_t weighted_dec
             bint syn_prior, syn_post
-            np.uint32_t temp_sink, temp_sink2
+            np.ndarray[np.uint32_t] buffer = np.full(16, -1, dtype=np.uint32)
+            # np.uint32_t x, y
+            # int dim, inp_num
+            # np.ndarray[np.int64_t] inp_loc
+            # int num_candidates
+            # float out_loc
+            # np.ndarray[np.float64_t] pdf
+        assert(presyn_perms is None) # Unimplemented.
 
         # Arguments override initialized or default values.
-        inc = permanence_inc if permanence_inc is not None else self.permanence_inc
-        dec = permanence_dec if permanence_dec is not None else self.permanence_dec
-        weighted_inc = inc
-        weighted_dec = dec
-        if inc == 0. and dec == 0.:
+        base_inc = permanence_inc if permanence_inc is not None else self.permanence_inc
+        base_dec = permanence_dec if permanence_dec is not None else self.permanence_dec
+        if base_inc == 0. and base_dec == 0.:
             return
 
-        # This loop works for two loop variants, indexes and traces.
-        if traces_ is None:
-            out_loop_size = output_activity.shape[0]
-        else:
-            out_loop_size = traces_.shape[0]
-            assert(traces_.shape[0] == self.outputs.dimensions)
+        # if _add_synapses:
+        #     # output_index = self.outputs.index
+        #     input_index = self.inputs.index
 
-        for out_iter in range(out_loop_size):
-            if traces_ is None:
-                out_idx1    = output_activity[out_iter]
-            else:
-                trace       = traces_[out_iter]
-                if trace == 0.:
-                    continue
-                weighted_inc = inc * trace
-                weighted_dec = dec * trace
-                out_idx1    = out_iter
+        for out_iter in range(output_activity.shape[0]):
+            out_idx1 = output_activity[out_iter]
+            # <type?> is safe case, <type> is unsafe cast.
+            sources_inner    = <np.ndarray[np.uint32_t]>  sources[out_idx1]
+            sources2_inner   = <np.ndarray[np.uint32_t]>  sources2[out_idx1]
+            perms_inner      = <np.ndarray[PERMANENCE_t]> permanences[out_idx1]
+            # disconnected_len = 0
 
-            # Unsafe type cast.
-            sources_inner   = <np.ndarray[np.uint32_t, ndim=1]>  sources[out_idx1]
-            sources2_inner  = <np.ndarray[np.uint32_t, ndim=1]>  sources2[out_idx1]
-            perms_inner     = <np.ndarray[PERMANENCE_t, ndim=1]> permanences[out_idx1]
+            # Scale permanence updates by the activation strength.
+            output_value = output_values[out_iter]
+            inc = base_inc * output_value
+            dec = base_dec * output_value
 
             for out_idx2 in range(sources_inner.shape[0]):
                 inp_idx1     = sources_inner[out_idx2]
                 perm_value   = perms_inner[out_idx2]
-
                 syn_prior    = perm_value >= thresh
-                if input_activity[inp_idx1] != 0:
-                    perm_value += weighted_inc
-                    if perm_value > 1.:
-                        perm_value = 1.
+                input_value  = input_activity[inp_idx1]
+                if input_value != 0:
+                    perm_value += inc * input_value
+                    # TODO: Save this input location so that nearby segments can
+                    # sample the currently active inputs.  Only do this if
+                    # topology is used.
                 else:
-                    perm_value -= weighted_dec
-                    if perm_value < 0.:
-                        perm_value = 0.
+                    perm_value -= dec
+                # Clip to [0, 1]
+                if perm_value > 1.:
+                    perm_value = 1.
+                elif perm_value < 0.:
+                    perm_value = 0.
+                    # Consider disconnecting the synapse when it clips beneath zero.
+                    # if disconnected_len < _add_synapses:
+                    #     disconnected[disconnected_len] = out_idx2
+                    #     disconnected_len += 1
+                #
                 syn_post      = perm_value >= thresh
                 perms_inner[out_idx2] = perm_value
 
+                # if presyn_perms is not None:
+                #     inp_idx2     = sources2_inner[out_idx2]
+                #     presyn_perms_inner = <np.ndarray[PERMANENCE_t]> presyn_perms[inp_idx1]
+                #     presyn_perms_inner[inp_idx2] = perm_value
+
                 if syn_prior != syn_post:
+                    # if presyn_perms is not None:
+                    #     print(syn_prior, syn_post, perm_value)
                     inp_idx2     = sources2_inner[out_idx2]
-                    sinks_inner  = <np.ndarray[np.uint32_t, ndim=1]> sinks[inp_idx1]
-                    sinks2_inner = <np.ndarray[np.uint32_t, ndim=1]> sinks2[inp_idx1]
-                    # Repartition the sinks table.  First determine
-                    # inp_idx2_swap, which is the synapse to swap with.
+                    sinks_inner  = <np.ndarray[np.uint32_t]> sinks[inp_idx1]
+                    sinks2_inner = <np.ndarray[np.uint32_t]> sinks2[inp_idx1]
+                    sink_size    = sinks_sizes[inp_idx1]
+
                     if syn_post:
-                        # Connect this synapse.  Swap to the bottom of the
-                        # disconnected partition and then increment the
-                        # partition across the now connected synapse.
-                        inp_idx2_swap = sink_partitions[inp_idx1]
-                        sink_partitions[inp_idx1] = inp_idx2_swap + 1
+                        # Connect this synapse.  First check if there is enough
+                        # room in the presynaptic tables for another synapse.
+                        if sink_size >= sinks_inner.shape[0]:
+                            sinks_inner      = np.append(sinks_inner,  buffer)
+                            sinks2_inner     = np.append(sinks2_inner, buffer)
+                            sinks[inp_idx1]  = sinks_inner
+                            sinks2[inp_idx1] = sinks2_inner
+                        # Write synapse.
+                        sinks_inner[sink_size]   = out_idx1
+                        sinks2_inner[sink_size]  = out_idx2
+                        sources2_inner[out_idx2] = sink_size
+                        sinks_sizes[inp_idx1]    = sink_size + 1
+
                     else:
-                        # Disconnect this synapse.  Swap to end of the connected
-                        # partition and then decrement the partition across the
-                        # now disconnected synapse.
-                        inp_idx2_swap = sink_partitions[inp_idx1] - 1
-                        sink_partitions[inp_idx1] = inp_idx2_swap
-
-                    # Do the swap.  Notify the postsynaptic side of the synapse
-                    # which got preempted.
-                    out_idx_1_swap = sinks_inner[inp_idx2_swap]
-                    out_idx_2_swap = sinks2_inner[inp_idx2_swap]
-                    sources2_inner_swap = <np.ndarray[np.uint32_t, ndim=1]> sources2[out_idx_1_swap]
-                    sources2_inner_swap[out_idx_2_swap] = inp_idx2
-                    # Notify the postsynaptic side of the synapse which was
-                    # moved across the partition.
-                    sources2_inner[out_idx2] = inp_idx2_swap
-
-                    # Swap the synapses in the sinks tables.
-                    temp_sink                   = sinks_inner[inp_idx2_swap]
-                    sinks_inner[inp_idx2_swap]  = sinks_inner[inp_idx2]
-                    sinks_inner[inp_idx2]       = temp_sink
-                    # Second swap for the inner index.
-                    temp_sink2                  = sinks2_inner[inp_idx2_swap]
-                    sinks2_inner[inp_idx2_swap] = sinks2_inner[inp_idx2]
-                    sinks2_inner[inp_idx2]      = temp_sink2
-    learn = learn_outputs
+                        # Disconnect this synapse.  Overwrite this this synapses
+                        # presynaptic data with the last entry in each table,
+                        # then decrement the tables logical size.
+                        sink_size -= 1  # Synapse at this index gets moved to inp_idx2.
+                        out_idx_1_move = sinks_inner[sink_size]
+                        out_idx_2_move = sinks2_inner[sink_size]
+                        # Move the synapse in the sinks tables.
+                        sinks_inner[inp_idx2]       = out_idx_1_move
+                        sinks2_inner[inp_idx2]      = out_idx_2_move
+                        # Notify the postsynaptic side of the synapse which gets moved.
+                        sources2_inner_move = <np.ndarray[np.uint32_t]> sources2[out_idx_1_move]
+                        sources2_inner_move[out_idx_2_move] = inp_idx2
+                        # Decrement the size of the sinks-inner tables.
+                        sinks_sizes[inp_idx1]       = sink_size
+                        # Delete the disconnected synapse from the postsyn tables.
+                        sources2_inner[out_idx2] = -1
 
     @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
     @cython.wraparound(DEBUG)  # Turns off negative index wrapping for entire function.
-    def learn_inputs(self, input_sdr=None, output_sdr=None, permanence_inc=None, permanence_dec=None):
+    def add_synapses(self, synapses_per_output, 
+        init_dist = None,
+        input_sdr=None, output_sdr=None,):
         """
-        Update permanences and then synapses.
+        add_synapses will automatically replace potential synapses with zero
+        permanence.  Sources for the new synapses are sampled from the
+        input_sdr.
 
-        Instead of decrementing permanences when then output fires without
-        the input, decrement when the input fires and the output doesn't.
-        This is the difference bewtween P implies Q and Q implies P, or in
-        this context:
-            neuron activation -> Proximal/Basal input
-              and
-            Apical input -> neuron activation
-        """
-        """
-        I think the idea was that this different learning rule would 'protect'
-        synapses which are not often used.  The thing is there is already a
-        protection mechanism...  Synapses only learn if their segment meets the
-        learning threshold which protects segments when they aren't in use.
-        BG presynaptic sources only need to worry about unlearning things which
-        they're currently trying to do.  Don't use this method?
-        """
-        self.inputs.assign(input_sdr)
-        self.outputs.assign(output_sdr)
-
-        cdef PERMANENCE_t perm_value, inc, dec, thresh = self.permanence_thresh
-        cdef bint syn_prior, syn_post
-        cdef np.uint32_t inp_idx1, inp_idx2, out_idx1, out_idx2
-        cdef np.int8_t inp, out
-        cdef bint loop_skip
-        cdef np.uint32_t original_partition
-
-
-        inc = permanence_inc if permanence_inc is not None else self.permanence_inc
-        dec = permanence_dec if permanence_dec is not None else self.permanence_dec
-
-        cdef:
-            # Data Tables
-            np.ndarray[dtype=object] sources          = self.postsynaptic_sources
-            np.ndarray[dtype=object] sources2         = self.postsynaptic_source_side_index
-            np.ndarray[dtype=object] permanences      = self.postsynaptic_permanences
-            np.ndarray[dtype=object] sinks            = self.presynaptic_sinks
-            np.ndarray[dtype=object] sinks2           = self.presynaptic_sink_side_index
-            np.ndarray[np.uint32_t]  sink_partitions  = self.presynaptic_partitions
-            np.ndarray[np.int8_t]    input_activity   = self.inputs.dense.reshape(-1)
-            np.ndarray[np.int8_t]    dense_output     = self.outputs.dense.reshape(-1)
-            # Swap Variables
-            np.uint32_t temp_sink, temp_sink2, inp_idx2_swap, out_idx_1_swap, out_idx_2_swap
-            np.ndarray[np.uint32_t]  sinks_inner
-            np.ndarray[np.uint32_t]  sinks2_inner
-
-        # Iterate through the active inputs.
-        for inp_idx1 in range(input_activity.shape[0]):
-            inp = input_activity[inp_idx1]
-            if inp == 0:
-                continue
-
-            # Make sure not to process newly disconnected synapses twice. They
-            # are moved into the range between the start of the disconnected
-            # partition and where the start of said partition was when this
-            # method began.  Skip this section of the loop.
-            original_partition = sink_partitions[inp_idx1]
-            # Do the loop skip unless it would skip off the end of the array.
-            loop_skip          = original_partition < sinks[inp_idx1].shape[0]
-            for inp_idx2 in range(sinks[inp_idx1].shape[0]):
-                if inp_idx2 == sink_partitions[inp_idx1]:
-                    if loop_skip:
-                        inp_idx2  = original_partition
-                        loop_skip = False   # Don't do this step twice.
-
-                # Modify the synapses permanence.
-                out_idx1    = sinks [inp_idx1][inp_idx2]
-                out_idx2    = sinks2[inp_idx1][inp_idx2]
-                out         = dense_output[out_idx1]
-                perm_value  = permanences[out_idx1][out_idx2]
-                syn_prior   = perm_value >= thresh
-                if out != 0:
-                    perm_value += inc
-                    if perm_value > 1.:
-                        perm_value = 1.
-                else:
-                    perm_value -= dec
-                    if perm_value < 0.:
-                        perm_value = 0.
-                syn_post = perm_value >= thresh
-                permanences[out_idx1][out_idx2] = perm_value
-
-                if syn_prior != syn_post:
-                    # Repartition the sinks table.  First determine
-                    # inp_idx2_swap, which is the synapse to swap with.
-                    if syn_post:
-                        # Connect this synapse.  Swap to the bottom of the
-                        # disconnected partition and then increment the
-                        # partition across the now connected synapse.
-                        inp_idx2_swap = sink_partitions[inp_idx1]
-                        sink_partitions[inp_idx1] = inp_idx2_swap + 1
-                    else:
-                        # Disconnect this synapse.  Swap to end of the connected
-                        # partition and then decrement the partition across the
-                        # now disconnected synapse.
-                        inp_idx2_swap = sink_partitions[inp_idx1] - 1
-                        sink_partitions[inp_idx1] = inp_idx2_swap
-
-                    # Do the swap.  Notify the postsynaptic side of the synapse
-                    # which got preempted.
-                    out_idx_1_swap = sinks [inp_idx1][inp_idx2_swap]
-                    out_idx_2_swap = sinks2[inp_idx1][inp_idx2_swap]
-                    sources2[out_idx_1_swap][out_idx_2_swap] = inp_idx2
-                    # Notify the postsynaptic side of the synapse which was
-                    # moved across the partition.
-                    sources2[out_idx1][out_idx2] = inp_idx2_swap
-
-                    # Swap the synapses in the sinks tables.
-                    sinks_inner                 = sinks[inp_idx1]
-                    temp_sink                   = sinks_inner[inp_idx2_swap]
-                    sinks_inner[inp_idx2_swap]  = sinks_inner[inp_idx2]
-                    sinks_inner[inp_idx2]       = temp_sink
-                    # Second swap for the inner index.
-                    sinks2_inner                = sinks2[inp_idx1]
-                    temp_sink2                  = sinks2_inner[inp_idx2_swap]
-                    sinks2_inner[inp_idx2_swap] = sinks2_inner[inp_idx2]
-                    sinks2_inner[inp_idx2]      = temp_sink2
-
-                    if not syn_post:
-                        # Decrement the loop counter so that the preempted
-                        # synapse gets processed instead of skipped over.
-                        inp_idx2 -= 1
-
-    @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
-    @cython.wraparound(DEBUG)  # Turns off negative index wrapping for entire function.
-    def add_synapses(self, input_sdr=None, output_sdr=None, synapses_per_output=None, maximum_synapses=None,
-        init_value=None):
-        """
+        Argument synapses_per_output is rounded to integer ...
+        Argument init_dist is (mean, std) of synapse initial permanence distribution.
         Argument inputs is index array ...
         Argument outputs is index array ...
-        Argument synapses_per_output is number ...
-        Argument maximum_synapses is per output ...
         """
         self.inputs.assign(input_sdr)
         self.outputs.assign(output_sdr)
-        cdef np.ndarray[np.uint32_t] inputs_ = np.array(self.inputs.flat_index, dtype=np.uint32)
-        cdef np.ndarray[np.long_t] outputs_  = self.outputs.flat_index
+        cdef np.ndarray[np.uint32_t] inputs_   = np.array(self.inputs.flat_index, dtype=np.uint32)
+        cdef np.ndarray[np.double_t] nz_values = self.inputs.nz_values / np.sum(self.inputs.nz_values)
+        cdef np.ndarray[np.long_t]   outputs_  = self.outputs.flat_index
         if not len(inputs_):
             return
+        buffer_size  = 20
+        index_buffer = np.full(buffer_size, -1, dtype=np.uint32)
+        # perms_buffer = np.full(buffer_size, float('nan'), dtype=PERMANENCE)
 
-        cdef int synapses_per_output_  = int(round(synapses_per_output))
-        cdef int maximum_synapses_     = int(round(maximum_synapses))
-        cdef PERMANENCE_t perm, thresh = self.permanence_thresh
+        if init_dist is not None:
+            init_mean, init_std = init_dist
+        else:
+            init_mean, init_std = self.init_dist
 
         cdef:
             # Data Tables.
             np.ndarray[dtype=object] sources          = self.postsynaptic_sources
             np.ndarray[dtype=object] sources2         = self.postsynaptic_source_side_index
             np.ndarray[dtype=object] permanences      = self.postsynaptic_permanences
+            # np.ndarray[dtype=object] presyn_perms     = getattr(self, 'presynaptic_permanences', None)
             np.ndarray[dtype=object] sinks            = self.presynaptic_sinks
             np.ndarray[dtype=object] sinks2           = self.presynaptic_sink_side_index
-            np.ndarray[np.uint32_t]  sink_partitions  = self.presynaptic_partitions
-            # Swap Variables.
-            np.uint32_t temp_sink, temp_sink2, inp_idx2_swap, out_idx_1_swap, out_idx_2_swap
+            np.ndarray[np.uint32_t]  sinks_sizes      = self.presynaptic_sinks_sizes
+            # Inner array pointers.
             np.ndarray[np.uint32_t]  sources_inner
+            np.ndarray[np.uint32_t]  sources2_inner
+            np.ndarray[PERMANENCE_t] perms_inner
             np.ndarray[np.uint32_t]  sinks_inner
             np.ndarray[np.uint32_t]  sinks2_inner
-            # Local indexes and counters.
-            int num_synapses
+            # np.ndarray[PERMANENCE_t] presyn_perms_inner
+
+            # Locals indexes and counters.
             int out_iter, out_idx, out_idx2
             np.uint32_t inp, inp_idx2
-            int old_size, offset
+            int offset
+            int num_synapses = min(int(round(synapses_per_output)), inputs_.shape[0])
+            int num_zero_perm_synapses
+            np.ndarray[np.int_t] zero_perm_synapses = np.empty(num_synapses, dtype=np.int)
             np.ndarray[np.uint32_t]  candidate_sources
-            # np.ndarray[np.bool_t]    unique_sources
             np.ndarray[np.uint32_t]  new_sources
             np.ndarray[PERMANENCE_t] new_permanances
+            PERMANENCE_t perm, thresh = self.permanence_thresh
 
         for out_iter in range(outputs_.shape[0]):
             out_idx           = outputs_[out_iter]
-            sources_inner     = sources[out_idx]
-            old_size          = sources_inner.shape[0]
+            sources_inner     = <np.ndarray[np.uint32_t]>  sources[out_idx] # Unsafe Typecasts!
+            sources2_inner    = <np.ndarray[np.uint32_t]>  sources2[out_idx]
+            perms_inner       = <np.ndarray[PERMANENCE_t]> permanences[out_idx]
+
+            # Search for zero permanence synapses to overwrite.
+            num_zero_perm_synapses = 0
+            for out_idx2 in range(perms_inner.shape[0]):
+                if perms_inner[out_idx2] == 0:
+                    zero_perm_synapses[num_zero_perm_synapses] = out_idx2
+                    num_zero_perm_synapses += 1
+                if num_zero_perm_synapses >= num_synapses:
+                    break
 
             # Randomly select inputs which are not already connected to.
-            num_synapses      = min(synapses_per_output_, maximum_synapses_ - old_size, inputs_.shape[0])
-            candidate_sources = np.random.choice(inputs_, (num_synapses,), replace=False)
-            unique_sources    = np.isin(candidate_sources, sources_inner, assume_unique=True, invert=True)
+            candidate_sources = np.random.choice(inputs_,
+                                    size    = num_zero_perm_synapses,
+                                    replace = False,
+                                    p       = nz_values,)
+            unique_sources    = np.isin(candidate_sources, sources_inner, invert=True,
+                                        assume_unique = True,)
+            # TODO CRITICAL: Filter out this neuron if it's here.  Neurons
+            # shouldn't form synapses with themselves.
             new_sources       = candidate_sources[unique_sources]
-            # Append to the sources & permanence tables.
-            if init_value is None:
-                new_permanances  = np.array(np.random.uniform(size=new_sources.shape[0]), dtype=PERMANENCE)
-            else:
-                new_permanances  = np.empty(new_sources.shape[0], dtype=PERMANENCE)
-                new_permanances.fill(init_value)
-            sources[out_idx]     = np.append(sources_inner,        new_sources)
-            permanences[out_idx] = np.append(permanences[out_idx], new_permanances)
-            sources2[out_idx]    = np.append(sources2[out_idx],    np.empty(new_sources.shape[0], dtype=np.uint32))
-            # Insert new synapses into the sinks tables.
+            # Random initial distribution of permanence values.
+            new_permanances_f64 = np.random.normal(init_mean, init_std, size=new_sources.shape[0])
+            new_permanances     = np.array(new_permanances_f64, dtype=PERMANENCE)
+            new_permanances     = np.clip(new_permanances, 0., 1.)
+
             for offset in range(new_sources.shape[0]):
-                inp          = new_sources[offset]
-                perm         = new_permanances[offset]
-                out_idx2     = old_size + offset
-                sinks_inner  = sinks[inp]
-                sinks2_inner = sinks2[inp]
-                inp_idx2     = sinks_inner.shape[0] # Append and swap if needed.
-                sinks[inp]   = sinks_inner  = np.append(sinks_inner, np.uint32(out_idx))
-                sinks2[inp]  = sinks2_inner = np.append(sinks2_inner, np.uint32(out_idx2))
-                sources2[out_idx][out_idx2] = inp_idx2
+                out_idx2 = zero_perm_synapses[offset]
+
+                # Get and write the synapse in the postsynaptic sources tables.
+                perm        = new_permanances[offset]
+                inp         = new_sources[offset]   # 'inp' should really be named 'inp_idx1'.
+                sources_inner[out_idx2] = inp
+                perms_inner[out_idx2]   = perm
+
+                # Insert new synapses into the sinks tables.
                 if perm >= thresh:
-                    # Connect this synapse.  Swap to the bottom of the
-                    # disconnected partition and then increment the partition
-                    # across the now connected synapse.
-                    inp_idx2_swap = sink_partitions[inp]
-                    sink_partitions[inp] = inp_idx2_swap + 1
+                    # Append new synapse to sinks table.
+                    inp_idx2         = sinks_sizes[inp]
+                    sinks_sizes[inp] += 1
+                    sources2_inner[out_idx2] = inp_idx2
+                    sinks_inner  = <np.ndarray[np.uint32_t]> sinks[inp]
+                    sinks2_inner = <np.ndarray[np.uint32_t]> sinks2[inp]
+                    # if presyn_perms is not None:
+                    #     presyn_perms_inner = presyn_perms[inp]
+                    # Resize sinks table if necessary.
+                    if inp_idx2 >= sinks_inner.shape[0]:
+                        sinks_inner  = np.append(sinks_inner,  index_buffer)
+                        sinks2_inner = np.append(sinks2_inner, index_buffer)
+                        sinks[inp]   = sinks_inner
+                        sinks2[inp]  = sinks2_inner
+                        # if presyn_perms is not None:
+                        #     presyn_perms[inp] = presyn_perms_inner = np.append(presyn_perms_inner, perms_buffer)
+                    sinks_inner[inp_idx2]  = out_idx
+                    sinks2_inner[inp_idx2] = out_idx2
+                    # if presyn_perms is not None:
+                    #     presyn_perms_inner[inp_idx2] = perm
+                else:
+                    sources2_inner[out_idx2] = -1
 
-                    # Do the swap.  Notify the postsynaptic side of the synapse
-                    # which got preempted.
-                    out_idx_1_swap = sinks_inner[inp_idx2_swap]
-                    out_idx_2_swap = sinks2_inner[inp_idx2_swap]
-                    sources2[out_idx_1_swap][out_idx_2_swap] = inp_idx2
-                    # Notify the postsynaptic side of the synapse which was
-                    # moved across the partition.
-                    sources2[out_idx][out_idx2] = inp_idx2_swap
-
-                    # Swap the synapses in the sinks tables.
-                    temp_sink                   = sinks_inner[inp_idx2_swap]
-                    sinks_inner[inp_idx2_swap]  = sinks_inner[inp_idx2]
-                    sinks_inner[inp_idx2]       = temp_sink
-                    # Second swap for the inner index.
-                    temp_sink2                  = sinks2_inner[inp_idx2_swap]
-                    sinks2_inner[inp_idx2_swap] = sinks2_inner[inp_idx2]
-                    sinks2_inner[inp_idx2]      = temp_sink2
-
-    def normally_distributed_connections(self, potential_pool, radii, init_dist=None):
+    def normally_distributed_connections(self, potential_pool, radii):
         """
         Makes synapses from inputs to outputs within their local neighborhood.
         The outputs exist on a uniform grid which is stretched over the input
         space.  An outputs local neighborhood is defined by a gaussian window
         centered over the output with standard deviations given by argument
         radii.
+
+        Argument potential_pool is the number of potential inputs to connect
+                 each output to.
 
         Argument radii is tuple of standard deivations. Radii units are the
                  input space units.  Radii defines the topology of the
@@ -947,9 +1037,6 @@ class SynapseManager:
                  dimensions are treated with uniform probability; only distances
                  in the topological dimensions effect the probability of forming
                  a potential synapse.
-
-        Argument potential_pool is the number of potential inputs to connect
-                 each output to.
 
         Attributes set by this method:
             self.potential_pool_density_1,
@@ -967,9 +1054,12 @@ class SynapseManager:
         Note: this method does NOT check for duplicate synapses and should only
         be called on an empty synapse manager with no existing synapses.
         """
-        radii = np.array(radii)
+        radii = np.array(self.radii)
+        if len(radii) == 0:
+            return self.uniformly_distributed_connections(potential_pool)
         assert(len(radii.shape) == 1)
-        potential_pool = int(round(potential_pool))
+        potential_pool      = int(round(potential_pool))
+        init_mean, init_std = self.init_dist
 
         # Split the input space into topological and extra dimensions.
         topo_dimensions  = self.inputs.dimensions[: len(radii)]
@@ -999,6 +1089,7 @@ class SynapseManager:
         output_locations *= column_spacing
         output_locations += np.array(padding).reshape(len(topo_dimensions), 1)
         inhibition_radii  = radii / np.squeeze(column_spacing)
+        self.output_locations = output_locations
 
         for column_index in range(self.outputs.size):
             center = output_locations[:, column_index]
@@ -1033,10 +1124,11 @@ class SynapseManager:
                 if empty_sources <= 0:
                     break
             else:
-                if empty_sources > .05 * potential_pool:
-                    raise ValueError("Not enough sources to fill potential pool.")
+                if empty_sources > .10 * potential_pool:
+                    raise ValueError("Not enough sources to fill potential pool, %d too many."%empty_sources)
                 else:
-                    print("Warning: Could not find enough unique inputs, allowing %d fewer inputs..."%empty_sources)
+                    pass
+                    # print("Warning: Could not find enough unique inputs, allowing %d fewer inputs..."%empty_sources)
             working_pool = working_pool[:potential_pool, :] # Discard extra samples
 
             # Measure some statistics about input density.
@@ -1051,17 +1143,15 @@ class SynapseManager:
             potential_pool_density_2 += pp_size_2 / num_inputs_2
             potential_pool_density_3 += pp_size_3 / num_inputs_3
 
+            # Generate random initial distribution of permanence values.
+            initial_permanences = np.random.normal(init_mean, init_std, size=(len(working_pool),))
+            initial_permanences = np.clip(initial_permanences, 0, 1)
+            initial_permanences = np.array(initial_permanences, dtype=PERMANENCE)
+
             # Flatten and write to output array.
             working_pool = np.ravel_multi_index(working_pool.T, self.inputs.dimensions)
             working_pool = np.array(working_pool, dtype=np.uint32)
-            if init_dist is None:
-                initial_permanences = np.random.uniform(size=(len(working_pool),))
-            else:
-                init_mean, init_std = init_dist
-                initial_permanences = np.random.normal(init_mean, init_std, size=(len(working_pool),))
-                initial_permanences = np.clip(initial_permanences, 0, 1)
-            initial_permanences = np.array(initial_permanences, dtype=PERMANENCE)
-            self.postsynaptic_sources[column_index] = np.append(self.postsynaptic_sources[column_index], working_pool)
+            self.postsynaptic_sources[column_index]     = np.append(self.postsynaptic_sources[column_index], working_pool)
             self.postsynaptic_permanences[column_index] = np.append(self.postsynaptic_permanences[column_index], initial_permanences)
 
         self.rebuild_indexes()
@@ -1069,6 +1159,7 @@ class SynapseManager:
         self.potential_pool_density_1 = potential_pool_density_1 / self.outputs.size
         self.potential_pool_density_2 = potential_pool_density_2 / self.outputs.size
         self.potential_pool_density_3 = potential_pool_density_3 / self.outputs.size
+        self.inhibition_radii = inhibition_radii
         return inhibition_radii
 
     def uniformly_distributed_connections(self, potential_pool, init_dist=None):
@@ -1077,20 +1168,25 @@ class SynapseManager:
         Directly sets the sources and permanence arrays, no returned value.
         Will raise ValueError if potential_pool is invalid.
 
+        Argument potential_pool is the number of potential inputs to connect
+                 each output to.
+
         Note: this method does NOT check for duplicate synapses and should only
         be called on an empty synapse manager with no existing synapses.
         """
         potential_pool = int(round(potential_pool))
+        if init_dist is not None:
+            init_mean, init_std = init_dist
+        else:
+            init_mean, init_std = self.init_dist
         for out_idx in range(self.outputs.size):
             syn_src = np.random.choice(self.inputs.size, potential_pool, replace=False)
             syn_src = np.array(syn_src, dtype=np.uint32)
-            if init_dist is None:
-                syn_prm = np.random.uniform(size=syn_src.shape)
-            else:
-                init_mean, init_std = init_dist
-                syn_prm = np.random.normal(init_mean, init_std, size=syn_src.shape)
-                syn_prm = np.clip(syn_prm, 0, 1)
+            # Random initial distribtution of permanence value
+            syn_prm = np.random.normal(init_mean, init_std, size=syn_src.shape)
+            syn_prm = np.clip(syn_prm, 0, 1)
             syn_prm = np.array(syn_prm, dtype=PERMANENCE)
+            # Append new sources and permanences to primary tables.
             self.postsynaptic_sources[out_idx]     = np.append(self.postsynaptic_sources[out_idx], syn_src)
             self.postsynaptic_permanences[out_idx] = np.append(self.postsynaptic_permanences[out_idx], syn_prm)
         self.rebuild_indexes()
@@ -1100,51 +1196,83 @@ class SynapseManager:
         This method uses the postsynaptic_sources and postsynaptic_permanences
         tables to rebuild all of the other needed tables.
         """
-        self.presynaptic_sinks              = sinks   = np.empty(self.inputs.size,  dtype=object)
-        self.presynaptic_sink_side_index    = sinks2  = np.empty(self.inputs.size,  dtype=object)
-        presynaptic_permanences             = perms   = np.empty(self.inputs.size,  dtype=object)
-        self.presynaptic_partitions         = parts   = np.zeros(self.inputs.size,  dtype=np.uint32)
-        self.postsynaptic_source_side_index = srcs2   = np.empty(self.outputs.size, dtype=object)
-
-        cdef int inp_idx, out_idx, synapse_num
-
-        # Initialize the index tables.
+        cdef:
+            # Data tables
+            np.ndarray[dtype=object] sources          = self.postsynaptic_sources
+            np.ndarray[dtype=object] permanences      = self.postsynaptic_permanences
+            np.ndarray[dtype=object] sinks            = np.empty(self.inputs.size,  dtype=object)
+            np.ndarray[dtype=object] sinks2           = np.empty(self.inputs.size,  dtype=object)
+            np.ndarray[np.uint32_t]  sinks_sizes      = np.zeros(self.inputs.size,  dtype=np.uint32)
+            np.ndarray[dtype=object] sources2         = np.empty(self.outputs.size, dtype=object)
+            # Inner array pointers
+            np.ndarray[np.uint32_t]  sources_inner
+            np.ndarray[np.uint32_t]  sources2_inner
+            np.ndarray[PERMANENCE_t] perms_inner
+            # Locals
+            int inp_idx, out_idx, synapse_num
+            PERMANENCE_t perm_val, thresh = self.permanence_thresh
+        # Initialize the index tables with python lists for fast append.
         for inp_idx in range(self.inputs.size):
-            sinks[inp_idx]  = []    # Init with python lists for fast append.
+            sinks[inp_idx]  = []
             sinks2[inp_idx] = []
-            perms[inp_idx]  = []
+        # Iterate through every synapse, build the tables.
         for out_idx in range(self.outputs.size):
-            assert(self.postsynaptic_sources[out_idx].dtype == np.uint32)
-            num_sources     = len(self.postsynaptic_sources[out_idx])
-            srcs2[out_idx]  = np.empty(num_sources, dtype=np.uint32)
-
-        # Iterate through every synapse, build the presynaptic_sinks table.
-        for out_idx in range(self.outputs.size):
-            sources_inner = self.postsynaptic_sources[out_idx]
-            perms_inner   = self.postsynaptic_permanences[out_idx]
+            sources_inner  = sources[out_idx]
+            perms_inner    = permanences[out_idx]
+            num_sources    = len(sources_inner)
+            sources2_inner = np.full(num_sources, -1, dtype=np.uint32)
             for synapse_num in range(sources_inner.shape[0]):
                 inp_idx  = sources_inner[synapse_num]
                 perm_val = perms_inner[synapse_num]
-                sinks[inp_idx].append(out_idx)
-                sinks2[inp_idx].append(synapse_num)
-                perms[inp_idx].append(perm_val)
-
-        # Partition the presynaptic_sinks table, also cast everything to numpy
-        # arrays.
+                assert(perm_val >= 0. and perm_val <= 1.)
+                if perm_val >= thresh:
+                    sinks[inp_idx].append(out_idx)
+                    sinks2[inp_idx].append(synapse_num)
+                    sources2_inner[synapse_num] = len(sinks[inp_idx])
+            sources2[out_idx] = sources2_inner
+        # Cast input tables to numpy arrays.
+        buffer = np.full(16, -1, dtype=np.uint32)
         for inp_idx in range(self.inputs.size):
-            permanences     = np.array(presynaptic_permanences[inp_idx], dtype=PERMANENCE)
-            sort_order      = np.argsort(-permanences)
-            thresh          = PERMANENCE(self.permanence_thresh)
-            parts[inp_idx]  = np.count_nonzero(permanences >= thresh)
-            unsorted_sinks  = np.array(sinks[inp_idx], dtype=np.uint32)
-            sinks[inp_idx]  = unsorted_sinks[sort_order]
-            unsorted_sinks2 = np.array(sinks2[inp_idx], dtype=np.uint32)
-            sinks2[inp_idx] = unsorted_sinks2[sort_order]
-            # Notify the output side about where each synapse ended up.
-            for synapse_num in range(sinks[inp_idx].shape[0]):
-                out_idx_1 = sinks[inp_idx][synapse_num]
-                out_idx_2 = sinks2[inp_idx][synapse_num]
-                srcs2[out_idx_1][out_idx_2] = synapse_num
+            sinks_sizes[inp_idx] = len(sinks[inp_idx])
+            sinks[inp_idx]       = np.append(np.array(sinks[inp_idx],  dtype=np.uint32), buffer)
+            sinks2[inp_idx]      = np.append(np.array(sinks2[inp_idx], dtype=np.uint32), buffer)
+        # Save the data tables.
+        self.presynaptic_sinks              = sinks
+        self.presynaptic_sink_side_index    = sinks2
+        self.presynaptic_sinks_sizes        = sinks_sizes
+        self.postsynaptic_source_side_index = sources2
+
+        if self.weighted:
+            self.rebuild_presyn_perms()
+
+    def rebuild_presyn_perms(self):
+        cdef:
+            # Data tables
+            np.ndarray[dtype=object] presyn_permanences
+            np.ndarray[dtype=object] sinks = self.presynaptic_sinks
+            np.ndarray[np.uint32_t] sinks_sizes = np.zeros(self.inputs.size,  dtype=np.uint32)
+            np.ndarray[dtype=object] sources  = self.postsynaptic_sources
+            np.ndarray[dtype=object] sources2 = self.postsynaptic_source_side_index
+            np.ndarray[dtype=object] postsyn_permanences      = self.postsynaptic_permanences
+            # Locals
+            int inp_idx, out_idx1, inp_idx1, inp_idx2
+            int num_sources
+            int num_sinks
+            PERMANENCE_t perm_value
+        # Initialize the table.
+        self.presynaptic_permanences = presyn_permanences = np.empty(self.inputs.size, dtype=object)
+        for inp_idx in range(self.inputs.size):
+            num_sinks = sinks[inp_idx].shape[0]
+            presyn_permanences[inp_idx] = np.empty(num_sinks, dtype=PERMANENCE)
+            presyn_permanences[inp_idx].fill(float('nan'))
+        # Fill in the data.
+        for out_idx1 in range(self.outputs.size):
+            num_sources = sources[out_idx1].shape[0]
+            for out_idx2 in range(num_sources):
+                inp_idx1   = sources[out_idx1][out_idx2]
+                inp_idx2   = sources2[out_idx1][out_idx2]
+                perm_value = postsyn_permanences[out_idx1][out_idx2]
+                presyn_permanences[inp_idx1][inp_idx2] = perm_value
 
     def copy(self):
         """
@@ -1162,8 +1290,8 @@ class SynapseManager:
         # TODO: DOCSTRING.  Add short explainations of what presynaptic,
         # postsynaptic, potential and connected mean.
         stats = 'Synapse Manager Statistics:\n'
-        stats += 'Input ' + self.inputs.statistics()
-        stats += 'Output ' + self.outputs.statistics()
+        # stats += 'Input ' + self.inputs.statistics()
+        # stats += 'Output ' + self.outputs.statistics()
         if hasattr(self, 'potential_pool_density_1'):
             stats += 'Potential Pool Density 1/2/3: {:5g} / {:5g} / {:5g}\n'.format(
                 self.potential_pool_density_1,
@@ -1172,17 +1300,20 @@ class SynapseManager:
 
         # Build a small table of min/mean/std/max for pre & post, potential &
         # connected synapse counts (16 values total).
-        presyn_potential  = [pp.shape[0] for pp in self.presynaptic_sinks]
-        presyn_connected  = self.presynaptic_partitions
+        # presyn_potential  = [pp.shape[0] for pp in self.presynaptic_sinks]
+        presyn_connected  = self.presynaptic_sinks_sizes
         postsyn_potential = [pp.shape[0] for pp in self.postsynaptic_sources]
         threshold         = PERMANENCE(self.permanence_thresh)
         postsyn_connected = [np.count_nonzero(pp_perm >= threshold)
                                 for pp_perm in self.postsynaptic_permanences]
+        postsyn_nonzero   = [np.count_nonzero(pp_perms)
+                                for pp_perms in self.postsynaptic_permanences]
         entries = [
-            (' '*8 + "Presyn sinks    Potential", presyn_potential),
+            # (' '*8 + "Presyn sinks    Potential", presyn_potential),
             (' '*8 + "Postsyn sources Potential", postsyn_potential),
             (' '*8 + "Presyn sinks    Connected", presyn_connected),
             (' '*8 + "Postsyn sources Connected", postsyn_connected),
+            (' '*8 + "Postsyn sources Nonzero  ", postsyn_nonzero),
         ]
         header  = ' '*8 + 'Synapse Counts'
         header += ' '*(len(entries[0][0]) - len(header))
@@ -1199,154 +1330,6 @@ class SynapseManager:
         return stats
 
 
-class WeightedSynapseManager(SynapseManager):
-    """
-    This class models weighted synapses.
-
-    Attributes postsynaptic_permanences, presynaptic_permanences contain the
-               synapse strength.  The compute method adds the synapse strength 
-               to the excitement accumulator instead of incrementing it.  The
-               learn method still modifies the permanence using hebbian learning.
-    """
-    def rebuild_indexes(self):
-        super().rebuild_indexes()
-        self.presynaptic_permanences = np.empty(self.inputs.size, dtype=object)
-        for idx in range(self.inputs.size):
-            num_sinks = self.presynaptic_sinks[idx].shape[0]
-            self.presynaptic_permanences[idx] = np.empty(num_sinks, dtype=np.float32)
-            self.presynaptic_permanences[idx].fill(float('nan'))
-        for out_idx1 in range(self.outputs.size):
-            num_sources = self.postsynaptic_sources[out_idx1].shape[0]
-            for out_idx2 in range(num_sources):
-                inp_idx1 = self.postsynaptic_sources[out_idx1][out_idx2]
-                inp_idx2 = self.postsynaptic_source_side_index[out_idx1][out_idx2]
-                self.presynaptic_permanences[inp_idx1][inp_idx2]
-
-    @cython.boundscheck(DEBUG) # Turns off bounds-checking for entire function.
-    @cython.wraparound(DEBUG)  # Turns off negative index wrapping for entire function.
-    def compute(self, input_sdr=None):
-        """
-        Applies presynaptic activity to synapses, returns the postsynaptic
-        excitment.
-
-        Argument input_sdr ... is assigned to this classes internal inputs SDR.
-                 If not given this uses the current value of its inputs SDR,
-                 which this synapse manager was initialized with.
-
-        Returns the excitement ... shape is output_sdr.dimensions
-        """
-        self.inputs.assign(input_sdr)
-
-        cdef:
-            np.ndarray[np.int_t]      active_inputs = self.inputs.flat_index
-            np.ndarray[dtype=object]  sinks_table   = self.presynaptic_sinks
-            np.ndarray[np.uint32_t]   sinks_entry
-            np.ndarray[dtype=object]  perms_table   = self.presynaptic_permanences
-            np.ndarray[PERMANENCE_t]  perms_entry
-            np.ndarray[np.float32_t]  excitement    = np.zeros(self.outputs.size, dtype=np.float32)
-            np.uint32_t inp_idx1, inp_idx2, out_idx
-            int iter1, iter2
-
-        for iter1 in range(active_inputs.shape[0]):
-            inp_idx1 = active_inputs[iter1]
-            IF DEBUG:   # Safe cast (type checks and throws exceptions if needed)
-                sinks_entry = <np.ndarray[np.uint32_t]?>  sinks_table[inp_idx1]
-                perms_entry = <np.ndarray[PERMANENCE_t]?> perms_table[inp_idx1]
-            ELSE:       # Unsafe Cast
-                sinks_entry = <np.ndarray[np.uint32_t]>  sinks_table[inp_idx1]
-                perms_entry = <np.ndarray[PERMANENCE_t]> perms_table[inp_idx1]
-            for inp_idx2 in range(sinks_entry.shape[0]):
-                out_idx = sinks_entry[inp_idx2]
-                excitement[out_idx] += perms_entry[inp_idx2]
-        return excitement.reshape(self.outputs.dimensions)
-
-    def learn_outputs(self, input_sdr=None, output_sdr=None,
-        permanence_inc = None,
-        permanence_dec = None,):
-        """
-        Wrapper around SynapseManager.learn_outputs() which updates the
-        presynaptic_permanences table.
-        """
-        super().learn_outputs(input_sdr=input_sdr, output_sdr=output_sdr,
-            permanence_inc = permanence_inc,
-            permanence_dec = permanence_dec)
-
-        cdef:
-            np.ndarray[np.int_t] output_activity = self.outputs.flat_index
-
-            # Data tables
-            np.ndarray[dtype=object] sources          = self.postsynaptic_sources
-            np.ndarray[dtype=object] sources2         = self.postsynaptic_source_side_index
-            np.ndarray[dtype=object] permanences      = self.postsynaptic_permanences
-            np.ndarray[dtype=object] presyn_perms     = self.presynaptic_permanences
-
-            # Inner array pointers
-            np.ndarray[np.uint32_t]  sources_inner
-            np.ndarray[np.uint32_t]  sources2_inner
-            np.ndarray[PERMANENCE_t] perms_inner
-            np.ndarray[PERMANENCE_t] presyn_perms_inner
-
-            # Locals
-            int out_iter, out_idx1, out_idx2
-            int inp_idx1, inp_idx2
-
-        for out_iter in range(len(self.outputs)):
-            out_idx1 = output_activity[out_iter]
-
-            # Unsafe type cast.
-            sources_inner   = <np.ndarray[np.uint32_t, ndim=1]>  sources[out_idx1]
-            sources2_inner  = <np.ndarray[np.uint32_t, ndim=1]>  sources2[out_idx1]
-            perms_inner     = <np.ndarray[PERMANENCE_t, ndim=1]> permanences[out_idx1]
-
-            for out_idx2 in range(sources_inner.shape[0]):
-                inp_idx1 = sources_inner[out_idx2]
-                inp_idx2 = sources2_inner[out_idx2]
-                presyn_perms_inner = <np.ndarray[PERMANENCE_t]> presyn_perms[inp_idx1]
-                presyn_perms_inner[inp_idx2] = perms_inner[out_idx2]
-
-    def add_synapses(self, *args, **kw_args):
-        super().add_synapses(*args, **kw_args)
-
-        # Update the presynaptic-permanences table.
-        cdef:
-            # Data Tables.
-            np.ndarray[dtype=object]  sinks         = self.presynaptic_sinks
-            np.ndarray[np.uint32_t]   sinks_inner
-            np.ndarray[dtype=object]  sinks2        = self.presynaptic_sink_side_index
-            np.ndarray[np.uint32_t]   sinks2_inner
-            np.ndarray[dtype=object]  presyn_perms  = self.presynaptic_permanences
-            np.ndarray[PERMANENCE_t]  presyn_perms_inner
-            np.ndarray[dtype=object]  postsyn_perms = self.postsynaptic_permanences
-            np.ndarray[PERMANENCE_t]  postsyn_perms_inner
-
-            # Locals.
-            int inp_idx1, inp_idx2
-            int num_sinks, num_perms
-            PERMANENCE_t perm
-
-        # Find all inputs which gained more sinks, but have not updated permanences.
-        for inp_idx1 in range(self.inputs.size):
-            sinks_inner        = sinks[inp_idx1]
-            presyn_perms_inner = presyn_perms[inp_idx1]
-            num_sinks   = sinks_inner.shape[0]
-            num_perms   = presyn_perms_inner.shape[0]
-            if num_sinks == num_perms:
-                continue
-            # Add space for the additional permanences.
-            presyn_perms_inner = np.concatenate([
-                presyn_perms_inner,
-                np.zeros(num_sinks - num_perms, dtype=PERMANENCE)])
-            presyn_perms[inp_idx1] = presyn_perms_inner
-            # Find and store the new permanence values.
-            sinks2_inner = sinks2[inp_idx1]
-            for inp_idx2 in range(num_perms, num_sinks):
-                out_idx1 = sinks_inner[inp_idx2]
-                out_idx2 = sinks2_inner[inp_idx2]
-                postsyn_perms_inner = postsyn_perms[out_idx1]
-                perm = postsyn_perms_inner[out_idx2]
-                presyn_perms_inner[inp_idx2] = perm
-
-
 class Dendrite:
     """
     Makes predictions.
@@ -1361,7 +1344,8 @@ class Dendrite:
         permanence_dec,
         mispredict_dec,
         add_synapses,
-        initial_segment_size,):
+        initial_segment_size,
+        init_dist,):
         """!"""
         # TODO: copy the docstrings from synapse manager since this is a pass through
         assert(isinstance(input_sdr, SDR))
@@ -1374,14 +1358,20 @@ class Dendrite:
         self.initial_segment_size = int(round(initial_segment_size))
         self.predictive_threshold = predictive_threshold
         self.learning_threshold   = learning_threshold
+        self.init_dist            = init_dist
 
         self.synapses = SynapseManager(
             input_sdr         = input_sdr,
             output_sdr        = SDR((self.active_sdr.size, self.segments_per_cell)),
+            radii             = None,
+            init_dist         = init_dist,
             permanence_thresh = permanence_thresh,
             permanence_inc    = permanence_inc,
             permanence_dec    = permanence_dec,)
         self.mispredict_dec   = mispredict_dec
+
+        self.synapses.uniformly_distributed_connections(self.synapses_per_segment, 
+            init_dist = (0, 0))
 
     def compute(self, input_sdr=None):
         self.excitement          = self.synapses.compute(input_sdr=input_sdr)
@@ -1402,32 +1392,48 @@ class Dendrite:
         segments in inactive neurons).  This penalizes only the synapses with
         active presynapses.
         """
-        mispredictions = np.array(self.predictive_segments, copy=True)
+        mispredictions = np.array(self.predictive_segments, copy=True, dtype=np.uint8)
         mispredictions[self.active_sdr.flat_index] = 0
-        self.synapses.learn_outputs(output_sdr     = mispredictions,
-                                    permanence_inc = -self.mispredict_dec,
-                                    permanence_dec = 0,)
+        self.synapses.learn(output_sdr     = mispredictions,
+                            permanence_inc = -self.mispredict_dec,
+                            permanence_dec = 0,)
 
     def _reinforce(self):
         """
         Reinforce segments which correctly predicted their neurons activation.
         Allows all segments which meet the learning threshold to learn.
         """
-        self.learning_segments = self.excitement[self.active_sdr.flat_index] >= self.learning_threshold
-        active_num, seg_idx    = np.nonzero(self.learning_segments)
-        active_idx             = self.active_sdr.flat_index[active_num]
-        self.synapses.learn_outputs(output_sdr = (active_idx, seg_idx),)
+        self.learning_segments  = self.excitement[self.active_sdr.flat_index] >= self.learning_threshold
+        active_num, seg_idx     = np.nonzero(self.learning_segments)
+        active_idx              = self.active_sdr.flat_index[active_num]
+        reinforce_sdr           = SDR(self.synapses.outputs.dimensions)
+        reinforce_sdr.index     = (active_idx, seg_idx)
+        reinforce_sdr.nz_values = self.active_sdr.nz_values[active_num]
+        self.synapses.learn(output_sdr = reinforce_sdr,)
 
     def _add_synapses(self):
         # Add more synapses to learning segments in neurons which are both
         # active and unpredicted.
-        unpred_active_mask = np.logical_not(self.predictions[self.active_sdr.flat_index])
-        neur_num, seg_idx  = np.nonzero(self.learning_segments[unpred_active_mask])
+        
+        # OR, add synapses to ALL learning segments (regardless of predictive state)
+        # active_predictions = self.predictions[self.active_sdr.flat_index]
+        # self.learning_segments[active_predictions] = 0
+        neur_num, seg_idx  = np.nonzero(self.learning_segments)
         neur_idx           = self.active_sdr.flat_index[neur_num]
         self.synapses.add_synapses(
             output_sdr          = (neur_idx, seg_idx),
             synapses_per_output = self.add_synapses,
-            maximum_synapses    = self.synapses_per_segment)
+            init_dist           = self.init_dist)
+
+        if False: # broken?  This combines slicing, masking, and a nonzero...
+            unpred_active_mask = np.logical_not(self.predictions[self.active_sdr.flat_index])
+            neur_num, seg_idx  = np.nonzero(self.learning_segments[unpred_active_mask])
+            neur_idx           = self.active_sdr.flat_index[neur_num]
+            self.synapses.add_synapses(
+                output_sdr          = (neur_idx, seg_idx),
+                synapses_per_output = self.add_synapses,
+                # maximum_synapses    = self.synapses_per_segment,
+                init_dist           = self.init_dist)
 
         # Start new segments on active neurons with no learning segments. Use
         # the segments with the fewest existing synapses, which improves the
@@ -1437,13 +1443,13 @@ class Dendrite:
         neur_idx                = self.active_sdr.flat_index[need_more_segments_mask]
         if len(neur_idx):
             segment_sources     = self.synapses.postsynaptic_sources.reshape(self.synapses.outputs.dimensions)
-            segment_sizes       = np.array([[seg.shape[0] for seg in seg_slice]
+            segment_sizes       = np.array([[np.count_nonzero(seg) for seg in seg_slice]
                                     for seg_slice in segment_sources[neur_idx, :]])
             seg_idx             = np.argmin(segment_sizes, axis=1)
             self.synapses.add_synapses(
                     output_sdr          = (neur_idx, seg_idx),
                     synapses_per_output = self.initial_segment_size,
-                    maximum_synapses    = self.synapses_per_segment)
+                    init_dist           = self.init_dist)
 
     def copy(self):
         cpy            = copy.copy(self)

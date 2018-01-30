@@ -1,15 +1,10 @@
 #!/usr/bin/python3
 # Written by David McDougall, 2017
 
-from mnist_sp import *
-from bg_test import *
-from eye_sp import *
-from stability_experiment import *
-from eye_sp_tm import *
-
 import genetics
 import argparse
 import sys
+import os, os.path
 
 parser = argparse.ArgumentParser()
 parser.add_argument('program_name', type=str)
@@ -19,10 +14,14 @@ parser.add_argument('--clone', type=str, default=None)
 parser.add_argument('--clear_fitness', action='store_true')
 parser.add_argument('--individuals',   action='store_true')
 parser.add_argument('--mean',   action='store_true')
+parser.add_argument('--max_children', type=int,
+    default=genetics.ExperimentMain.ArgumentParser().get_default('max_children'))
 args = parser.parse_args()
 
+module = os.path.splitext(os.path.basename(args.program_name))[0]
+exec('from ' + module + ' import *')
 sys.argv[0] = args.program_name
-pop = genetics.Population(args.population_name, args.population_size)
+pop = genetics.Population(args.population_name, args.population_size, args.max_children)
 
 if not len(pop):
     print("Population does not exist.")

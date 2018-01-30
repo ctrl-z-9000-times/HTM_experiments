@@ -456,6 +456,16 @@ class EyeSensor:
         self.position    = np.divide(self.image.shape[:2], 2)
         self.scale       = np.max(np.divide(self.image.shape[:2], self.eye_dimensions))
 
+    def show_view(self, window_name='Eye'):
+        if not hasattr(self, '_show_view_setup'):
+            plt.ion()
+            plt.show()
+            plt.gcf().canvas.set_window_title(window_name)
+            self._show_view_setup = True
+        plt.imshow(self.rgb, interpolation='nearest')
+        plt.draw()
+        plt.pause(0.00000001)
+
     def view(self):
         """
         Returns the image which the eye is currently seeing.
@@ -748,7 +758,7 @@ class EyeController:
         control_vectors[:, 3] += np.random.normal(0, scale_stddev/10,  control_shape)
         return control_vectors, SDR(control_shape)
 
-    def move(self, control_sdr=None):
+    def move(self, control_sdr=None, min_dist_from_edge=0):
         """
         Apply the given controls to the current gaze location and updates the
         motor sdr accordingly.
@@ -781,7 +791,8 @@ class EyeController:
         # Calculate the new position.  
         x, y     = eye.position
         p        = [x + dx, y + dy]
-        p        = np.clip(p, [0,0], eye.image.shape[:2])
+        edge     = min_dist_from_edge
+        p        = np.clip(p, [edge,edge], np.subtract(eye.image.shape[:2], edge))
         real_dp  = np.subtract(p, eye.position)
         eye.position = p
         # Book keeping.
@@ -812,9 +823,6 @@ class EyeController:
             self.eye_sensor.position[1],
             self.eye_sensor.orientation,
             self.eye_sensor.scale)]
-        # Update motor sensors, set the motor velocity to zero.
-        self.control_sdr.zero()
-        self.move()
 
     def gaze_tracking(self, diag=True):
         """
